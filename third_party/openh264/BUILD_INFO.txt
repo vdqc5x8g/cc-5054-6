@@ -1,0 +1,3 @@
+336bbf5a580b7147bde28a0234cda763d643419dff1e983e6274392eaa863bc6  third_party/openh264/lib/libopenh264.a
+source=https://github.com/cisco/openh264/archive/refs/tags/v2.4.1.tar.gz
+build=make -j ARCH=arm64 CC=/usr/bin/gcc CXX=/usr/bin/g++ AR=/usr/bin/ar

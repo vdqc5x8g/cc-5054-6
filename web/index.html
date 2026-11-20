@@ -1,0 +1,152 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>硬编接入实验台 · Encoder Lab</title>
+<link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <span class="logo" aria-hidden="true"></span>
+    <div>
+      <h1>硬编接入实验台</h1>
+      <p class="sub">真实图像表面 → 编码接口 → 异步码流 → 解码核对</p>
+    </div>
+  </div>
+  <div class="topstatus">
+    <span id="chipBackend" class="chip chip-muted">后端 —</span>
+    <span id="chipStatus" class="chip chip-muted">空闲</span>
+    <span id="chipCoverage" class="chip chip-warn">硬件未覆盖</span>
+  </div>
+</header>
+
+<main>
+  <section class="panel controls" aria-labelledby="h-controls">
+    <div class="panel-head">
+      <h2 id="h-controls">送帧参数</h2>
+      <div class="row-buttons">
+        <button id="btnStart" class="primary">开始运行</button>
+        <button id="btnStop" class="ghost" disabled>停止</button>
+      </div>
+    </div>
+
+    <div class="grid">
+      <label>编码后端
+        <select id="fBackend"></select>
+      </label>
+      <label>送帧方式
+        <select id="fMode">
+          <option value="paced">按帧率节流（paced）</option>
+          <option value="burst">尽可能快（burst）</option>
+          <option value="late">延迟回执（late）</option>
+          <option value="guard">所有权守卫（guard）</option>
+          <option value="corrupt">注入故障（corrupt）</option>
+        </select>
+      </label>
+      <label>分辨率
+        <select id="fSize">
+          <option value="320x180">320 × 180</option>
+          <option value="640x360" selected>640 × 360</option>
+          <option value="854x480">854 × 480</option>
+          <option value="1280x720">1280 × 720</option>
+        </select>
+      </label>
+      <label>帧率 <input id="fFps" type="number" min="1" max="60" value="30" /></label>
+      <label>码率 (bps) <input id="fBitrate" type="number" min="50000" max="50000000" step="50000" value="3000000" /></label>
+      <label>GOP <input id="fGop" type="number" min="1" max="600" value="30" /></label>
+      <label>表面池大小 <input id="fPool" type="number" min="2" max="8" value="4" /></label>
+      <label>帧数 <input id="fFrames" type="number" min="1" max="500" value="60" /></label>
+      <label id="lagWrap">回执延迟 (ms) <input id="fLag" type="number" min="0" max="2000" step="10" value="120" /></label>
+      <label class="wide">V4L2 设备
+        <select id="fDevice"></select>
+      </label>
+      <label class="wide">输入像素格式
+        <select id="fFormat">
+          <option value="">后端默认</option>
+          <option value="NV12">NV12</option>
+          <option value="I420">I420</option>
+        </select>
+      </label>
+    </div>
+
+    <div id="modeHint" class="hint"></div>
+    <div id="capsBox" class="caps"></div>
+  </section>
+
+  <section class="panel output" aria-labelledby="h-output">
+    <div class="panel-head">
+      <h2 id="h-output">结果区 · 输出画面与资源存活</h2>
+      <div class="viewer-tools">
+        <label class="inline">查看帧
+          <select id="frameSel"></select>
+        </label>
+        <button id="btnLive" class="ghost small" aria-pressed="true">跟随最新</button>
+      </div>
+    </div>
+
+    <div class="viewer">
+      <figure>
+        <img id="imgSrc" alt="送帧源画面" />
+        <figcaption>源画面 <span id="srcMeta" class="meta">—</span></figcaption>
+      </figure>
+      <figure>
+        <img id="imgOut" alt="解码后的输出画面" />
+        <figcaption>解码输出 <span id="outMeta" class="meta">—</span></figcaption>
+      </figure>
+    </div>
+
+    <div class="verdict" id="verdict">
+      <div class="verdict-line">
+        <strong id="vCreated">会话创建 —</strong>
+        <span id="vPipeline" class="tag">链路 —</span>
+        <span id="vHardware" class="tag">硬件覆盖 —</span>
+      </div>
+      <p id="vNote" class="note">尚未运行。</p>
+    </div>
+
+    <div class="frameinfo" id="frameInfo"></div>
+  </section>
+
+  <section class="panel surfaces" aria-labelledby="h-surfaces">
+    <div class="panel-head">
+      <h2 id="h-surfaces">表面状态（实际协商结果）</h2>
+      <span id="surfSummary" class="meta"></span>
+    </div>
+    <div id="surfCards" class="surf-cards"></div>
+  </section>
+
+  <section class="panel frames" aria-labelledby="h-frames">
+    <div class="panel-head">
+      <h2 id="h-frames">帧号 / 顺序 / 回执</h2>
+      <span id="frameSummary" class="meta"></span>
+    </div>
+    <div class="table-wrap">
+      <table id="frameTable">
+        <thead>
+          <tr>
+            <th>帧号</th><th>状态</th><th>表面</th><th>码流</th>
+            <th>标记 期望/实际</th><th>色块</th><th>颜色</th>
+            <th>MAE</th><th>提交→码流</th><th>提交→可复用</th><th>说明</th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="panel metrics" aria-labelledby="h-metrics">
+    <div class="panel-head"><h2 id="h-metrics">运行指标</h2></div>
+    <div id="metricGrid" class="metric-grid"></div>
+  </section>
+
+  <section class="panel logpanel" aria-labelledby="h-log">
+    <div class="panel-head"><h2 id="h-log">运行日志</h2></div>
+    <pre id="log" class="log" aria-live="polite"></pre>
+  </section>
+</main>
+
+<script src="/app.js"></script>
+</body>
+</html>
