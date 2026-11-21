@@ -16,9 +16,12 @@ struct EncoderSettings {
   int bitrate = 3000000;
   int gop = 30;
   int pool = 4;
+  int poolMax = 0;         // elastic scheduling ceiling (0 = fixed at `pool`)
   std::string format;      // empty = backend default
   std::string device;      // empty = first usable V4L2 node
   int receiptLagMs = 0;    // software harness only; never reported as device latency
+  int readDelayMs = 0;     // software harness: deferred input-read delay (DMA model)
+  int scanMs = 0;          // software harness: input scan duration once read starts
 };
 
 struct EncoderCaps {
@@ -104,6 +107,21 @@ class IEncoder {
   virtual bool requestEos(std::string& err) = 0;
   virtual bool eosComplete() const = 0;
   virtual bool eosSupported() const { return true; }
+  // Elastic-pool operations. growPool() adds one active surface (backend
+  // maximum permitting); shrinkPool() retires the given surface, which the
+  // caller guarantees is FREE. On host-memory backends these really
+  // allocate/free; on V4L2 the buffers are reserved by REQBUFS up front and
+  // grow/shrink only changes which buffers get queued. Backends that cannot
+  // resize keep the defaults and report false.
+  virtual bool growPool(std::string& err) {
+    (void)err;
+    return false;
+  }
+  virtual bool shrinkPool(int surfaceIdx, std::string& err) {
+    (void)surfaceIdx;
+    (void)err;
+    return false;
+  }
   // Backend-owned view of whether application code may still write this
   // surface. For V4L2 this is the actual driver queue state (buffer not yet
   // DQBUF'd); for the software backend it is the deferred-release state.

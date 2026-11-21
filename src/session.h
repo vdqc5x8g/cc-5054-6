@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <deque>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -17,7 +18,7 @@
 
 struct SessionConfig {
   std::string backend = "openh264";  // "openh264" | "v4l2"
-  std::string mode = "paced";        // paced | burst | late | guard | corrupt
+  std::string mode = "paced";  // paced | burst | late | guard | corrupt | earlyreuse
   int width = 640, height = 360;
   int fps = 30;
   int bitrate = 3000000;
@@ -28,10 +29,28 @@ struct SessionConfig {
   int receiptLagMs = 0;
   std::string device;
   std::string format;
+  // Surface scheduling: "fixed" pool or "elastic" grow/shrink on feedback.
+  std::string sched = "fixed";
+  int poolMin = 2;
+  int poolMax = 8;
+  // Deferred-read harness timers (software backend only).
+  int readDelayMs = 0;
+  int scanMs = 0;
+  // Event gate: stepMode = manual single-step; order = auto preference when
+  // both kinds are pending ("any" | "packet" | "return"); script replays a
+  // recorded schedule ('p' = apply packet event, 'r' = apply return event).
+  bool step = false;
+  std::string order = "any";
+  std::string script;
+  // Resolution switch: at frame switchAt the old generation keeps draining
+  // while a new generation is created at switchWidth x switchHeight.
+  int switchAt = -1;
+  int switchWidth = 0, switchHeight = 0;
 };
 
 struct SurfaceView {
   int index = 0;
+  int gen = 0;
   std::string state;
   uint64_t seq = UINT64_MAX;
   int reuse = 0;
@@ -48,6 +67,7 @@ struct FrameView {
   uint64_t seq = 0;
   int order = -1;
   int surfaceIndex = -1;
+  int gen = 0;
   std::string status = "pending";  // pending | ok | fail | skipped | lost
   bool accepted = false;
   bool bitstreamReady = false;
@@ -59,6 +79,11 @@ struct FrameView {
   bool decodeClean = false;
   bool corrupted = false;
   bool keyframe = false;
+  uint16_t cornerExpected = 0;
+  uint16_t cornerTags[4] = {0, 0, 0, 0};
+  int cornerValid = 0;
+  bool cornersOk = false;
+  bool cornersMixed = false;
   int auBytes = 0;
   double meanAbsError = -1;
   double submitToAuMs = -1;
@@ -75,16 +100,31 @@ struct RunMetrics {
   int outOfOrder = 0, duplicateSeq = 0, orphanAu = 0;
   int decodeErrors = 0, markerMismatches = 0, patchMismatches = 0;
   int colorMismatches = 0, pictureMismatches = 0;
+  int cornerMismatches = 0, mixedFrames = 0;
+  int ownershipViolations = 0;
+  int staleGenReleases = 0;
   int backpressureStalls = 0;
   double stallMsTotal = 0;
   int maxInFlight = 0;
   int guardRejections = 0;
   int guardChecks = 0;
+  int grows = 0, shrinks = 0, schedWaits = 0;
+  int peakActiveSurfaces = 0;
+  size_t peakMappedBytes = 0;
   int peakRssKb = 0, baselineRssKb = 0;
   size_t surfaceBytes = 0;
   int framesDrained = 0;
   double p50SubmitToAuMs = -1, maxSubmitToAuMs = -1;
   double p50SubmitToReleaseMs = -1, maxSubmitToReleaseMs = -1;
+};
+
+struct GenerationView {
+  int id = 0;
+  int width = 0, height = 0;
+  std::string state;  // active | draining | done
+  int surfaces = 0;
+  int freeSurfaces = 0;
+  size_t bytes = 0;
 };
 
 struct SessionSnapshot {
@@ -98,6 +138,8 @@ struct SessionSnapshot {
   bool pipelineVerified = false;
   bool hardwareCovered = false;
   std::string verificationNote;
+  std::string capacityHint;
+  std::string timingSource = "simulated";  // simulated | device
   bool eosRequested = false, eosComplete = false;
   bool decoderOpen = false;
   bool verifyEnabled = false;
@@ -105,7 +147,14 @@ struct SessionSnapshot {
   int framesDrained = 0;
   int leakedSurfaces = 0;
   size_t mappedBytes = 0;
+  // Event gate state for the stepper view.
+  bool stepMode = false;
+  int pendingPackets = 0;
+  int pendingReturns = 0;
+  size_t scriptPos = 0, scriptLen = 0;
+  std::string trace;
   std::vector<SurfaceView> surfaces;
+  std::vector<GenerationView> generations;
   std::vector<FrameView> frames;
   RunMetrics metrics;
   std::vector<std::string> log;
@@ -124,6 +173,10 @@ class Session {
   bool join(int timeoutMs);
   bool running() const { return worker_.joinable(); }
 
+  // Event gate controls (called from the HTTP thread).
+  bool stepEvents(const std::string& kind, int n, std::string& err);
+  void continueRun();
+
   SessionSnapshot snapshot() const;
   // kind: "src" | "out". seq == UINT64_MAX means latest available.
   bool framePng(const std::string& kind, uint64_t seq, int maxWidth,
@@ -138,25 +191,57 @@ class Session {
     bool keyframe = false;
   };
 
+  // One encoder generation. A resolution switch keeps the old generation
+  // alive (draining) while the new one is already accepting frames; surface
+  // releases are routed by generation so a stale release can never free a
+  // same-numbered surface of the new pool.
+  struct Generation {
+    int id = 0;
+    std::unique_ptr<IEncoder> enc;
+    EncoderCaps caps;
+    SurfaceFormat format;
+    ImageLayout layout;
+    H264Decoder dec;
+    bool decoderOpen = false;
+    int width = 0, height = 0;
+    bool eosRequested = false;
+    bool closed = false;
+    std::vector<int64_t> idleSinceUs;  // per-surface, for the shrink rule
+  };
+
+  struct PendingEv {
+    EncoderEvent ev;
+    int gen = 0;
+  };
+
   void workerMain();
-  void processEvents(std::vector<EncoderEvent>& evs, int64_t now);
-  void handleBitstream(EncoderEvent& ev, int64_t now);
-  void handleRelease(EncoderEvent& ev, int64_t now);
-  bool acquireSurface(int& idx, int64_t pacingDeadline);
+  bool makeGeneration(int width, int height, std::string& err);
+  void switchGeneration();
+  void closeGeneration(Generation& g);
+  Generation& cur() { return *gens_.back(); }
+  void pumpGeneration(Generation& g);
+  bool pumpAndGate();  // pump all generations, then apply the gate
+  int applyGate();     // returns events applied
+  void applyEvent(PendingEv& pe);
+  void handleBitstream(EncoderEvent& ev, Generation& g, int64_t now);
+  void handleRelease(EncoderEvent& ev, Generation& g, int64_t now);
+  bool acquireSurface(Generation& g, int& idx, int64_t pacingDeadline);
+  void maybeShrink(Generation& g);
+  double expectedOldestWaitMsLocked(Generation& g);
+  void maybeInjectOverwrite(int64_t now);
+  void updatePeaks();
   void logLine(const std::string& s);
   void finishRun(const std::string& status, const std::string& error);
   void finishRun(const std::string& status, const std::string& error,
                  int64_t endedUs);
-  void closeEncoder();
   FrameView* frameFor(uint64_t seq);
   void pruneArtifacts();
   void refreshSurfacesLocked();
+  bool quiescent() const;
+
   mutable std::mutex mu_;
   SessionConfig cfg_;
-  EncoderCaps caps_;
-  SurfaceFormat format_;
-  std::unique_ptr<IEncoder> enc_;
-  H264Decoder dec_;
+  std::vector<std::unique_ptr<Generation>> gens_;
   std::thread worker_;
   std::atomic<bool> stopFlag_{false};
   std::atomic<bool> workerDone_{false};
@@ -175,5 +260,22 @@ class Session {
   uint64_t lastLatencySeq_ = 0;
   bool haveLatencySeq_ = false;
   std::string fatal_;
-  ImageLayout layout_;
+
+  // Event gate.
+  std::deque<PendingEv> pending_;
+  bool stepMode_ = false;
+  std::deque<char> tokens_;  // 'p' | 'r' | 'a'
+  size_t scriptPos_ = 0;
+  std::string trace_;
+  int64_t gateBlockedSince_ = -1;
+
+  // Elastic scheduling bookkeeping.
+  std::vector<double> relLagMs_;
+
+  // earlyreuse fault injection: overwrite the victim's surface mid-scan.
+  bool overwritePending_ = false;
+  int64_t overwriteAtUs_ = 0;
+  int overwriteSurface_ = -1;
+  uint64_t overwritePlanSeq_ = 0;
+  int overwriteGen_ = -1;
 };

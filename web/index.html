@@ -19,6 +19,7 @@
     <span id="chipBackend" class="chip chip-muted">后端 —</span>
     <span id="chipStatus" class="chip chip-muted">空闲</span>
     <span id="chipCoverage" class="chip chip-warn">硬件未覆盖</span>
+    <span id="chipTiming" class="chip chip-warn">时序 —</span>
   </div>
 </header>
 
@@ -43,6 +44,7 @@
           <option value="late">延迟回执（late）</option>
           <option value="guard">所有权守卫（guard）</option>
           <option value="corrupt">注入故障（corrupt）</option>
+          <option value="earlyreuse">提前复用（earlyreuse）</option>
         </select>
       </label>
       <label>分辨率
@@ -71,8 +73,71 @@
       </label>
     </div>
 
+    <h3 class="subhead">表面调度器与事件门</h3>
+    <div class="grid">
+      <label>表面调度器
+        <select id="fSched">
+          <option value="fixed">固定池（fixed）</option>
+          <option value="elastic">弹性扩缩（elastic）</option>
+        </select>
+      </label>
+      <label>池下限 <input id="fPoolMin" type="number" min="1" max="8" value="2" /></label>
+      <label>池上限 <input id="fPoolMax" type="number" min="2" max="8" value="8" /></label>
+      <label>读延迟 (ms) <input id="fReadDelay" type="number" min="0" max="2000" step="10" value="0" /></label>
+      <label>扫描时长 (ms) <input id="fScan" type="number" min="0" max="2000" step="10" value="0" /></label>
+      <label>事件顺序
+        <select id="fOrder">
+          <option value="any">先到先放（any）</option>
+          <option value="packet">产包事件优先（packet）</option>
+          <option value="return">归还事件优先（return）</option>
+        </select>
+      </label>
+      <label class="inline wide">单步放行事件
+        <input id="fStep" type="checkbox" />
+      </label>
+      <label class="wide">重放脚本（p=产包 r=归还，留空不启用）
+        <input id="fScript" type="text" spellcheck="false" placeholder="例如 prprpprr…" />
+      </label>
+    </div>
+
+    <h3 class="subhead">分辨率切换（上一代排空期间新一代立即送帧）</h3>
+    <div class="grid">
+      <label>切换帧号（&lt;0 关闭） <input id="fSwitchAt" type="number" min="-1" max="499" value="-1" /></label>
+      <label>新分辨率
+        <select id="fSwitchSize">
+          <option value="480x270">480 × 270</option>
+          <option value="640x360">640 × 360</option>
+          <option value="320x180">320 × 180</option>
+          <option value="854x480">854 × 480</option>
+        </select>
+      </label>
+    </div>
+
     <div id="modeHint" class="hint"></div>
     <div id="capsBox" class="caps"></div>
+  </section>
+
+  <section class="panel gate" id="gatePanel" aria-labelledby="h-gate">
+    <div class="panel-head">
+      <h2 id="h-gate">事件门 · 单步放行产包与归还</h2>
+      <div class="row-buttons">
+        <button id="btnStepP" class="ghost small" disabled>步进 · 产包</button>
+        <button id="btnStepR" class="ghost small" disabled>步进 · 归还</button>
+        <button id="btnStepA" class="ghost small" disabled>步进 · 任意</button>
+        <button id="btnContinue" class="ghost small" disabled>继续放行</button>
+      </div>
+    </div>
+    <div class="gate-status">
+      <span id="gatePending" class="meta">待放行：产包 — · 归还 —</span>
+      <span id="gateScript" class="meta"></span>
+    </div>
+    <div class="trace-row">
+      <span class="meta">调度轨迹</span>
+      <code id="gateTrace" class="trace">—</code>
+      <button id="btnReplay" class="ghost small" disabled>重放此调度</button>
+      <button id="btnAB" class="ghost small">A/B 轨迹对照</button>
+    </div>
+    <div id="abResult" class="ab-result"></div>
   </section>
 
   <section class="panel output" aria-labelledby="h-output">
@@ -102,8 +167,10 @@
         <strong id="vCreated">会话创建 —</strong>
         <span id="vPipeline" class="tag">链路 —</span>
         <span id="vHardware" class="tag">硬件覆盖 —</span>
+        <span id="vTiming" class="tag">时序来源 —</span>
       </div>
       <p id="vNote" class="note">尚未运行。</p>
+      <p id="vCapacity" class="note capacity"></p>
     </div>
 
     <div class="frameinfo" id="frameInfo"></div>
@@ -111,9 +178,10 @@
 
   <section class="panel surfaces" aria-labelledby="h-surfaces">
     <div class="panel-head">
-      <h2 id="h-surfaces">表面状态（实际协商结果）</h2>
+      <h2 id="h-surfaces">表面状态（按代次分组）</h2>
       <span id="surfSummary" class="meta"></span>
     </div>
+    <div id="genCards" class="gen-cards"></div>
     <div id="surfCards" class="surf-cards"></div>
   </section>
 
@@ -126,8 +194,8 @@
       <table id="frameTable">
         <thead>
           <tr>
-            <th>帧号</th><th>状态</th><th>表面</th><th>码流</th>
-            <th>标记 期望/实际</th><th>色块</th><th>颜色</th>
+            <th>帧号</th><th>状态</th><th>代次</th><th>表面</th><th>码流</th>
+            <th>标记 期望/实际</th><th>角标（四角）</th><th>色块</th><th>颜色</th>
             <th>MAE</th><th>提交→码流</th><th>提交→可复用</th><th>说明</th>
           </tr>
         </thead>

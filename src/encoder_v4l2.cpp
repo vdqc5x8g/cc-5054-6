@@ -194,21 +194,83 @@ class V4l2Encoder : public IEncoder {
     if (!openDevice(err)) return false;
     if (!negotiateOutput(err)) return false;
     if (!negotiateCapture(err)) return false;
-    if (count < 2 || count > caps_.maxPool) {
+    if (count < 2 || count > 8) {
       err = "pool size must be 2..8";
       return false;
     }
-    if (!requestOutputBuffers(count, err)) return false;
-    if (!requestCaptureBuffers(std::max(4, count + 2), err)) return false;
-    if (!mapBuffers(err)) return false;
+    // REQBUFS reserves the elastic ceiling up front: on real hardware the
+    // buffers exist from the start and grow/shrink only changes which of
+    // them get QBUF'd. Reserved memory is therefore the honest peak.
+    int reserve = count;
+    if (s_.poolMax > reserve) reserve = s_.poolMax;
+    if (reserve > 8) reserve = 8;
+    if (!requestOutputBuffers(reserve, err)) return false;
+    if (!requestCaptureBuffers(std::max(4, reserve + 2), err)) return false;
+    if (!mapBuffers(count, err)) return false;
     if (!applyControls(err)) return false;
     if (!streamOn(err)) return false;
     tilesBuilt_ = true;
+    if (reserve > count)
+      caps_.notes.push_back(
+          "弹性池：REQBUFS 已预留 " + std::to_string(reserve) +
+          " 个输出缓冲，增长/收缩只改变参与排队的缓冲，不重新分配内存。");
     return true;
   }
 
   int surfaceCount() const override { return (int)surfaces_.size(); }
   Surface& surface(int i) override { return surfaces_[i]; }
+
+  bool growPool(std::string& err) override {
+    if ((int)surfaces_.size() >= (int)outBufs_.size()) {
+      err = "no reserved OUTPUT buffer left to activate";
+      return false;
+    }
+    int bi = -1;
+    for (size_t b = 0; b < outBufs_.size(); b++) {
+      bool mapped = false;
+      for (size_t si = 0; si < surfaceIdxToBuf_.size(); si++)
+        if (surfaceIdxToBuf_[si] == (int)b) mapped = true;
+      if (!mapped) {
+        bi = (int)b;
+        break;
+      }
+    }
+    if (bi < 0) {
+      err = "no reserved OUTPUT buffer left to activate";
+      return false;
+    }
+    int si = (int)surfaces_.size();
+    surfaces_.emplace_back();
+    surfaceIdxToBuf_.push_back(-1);
+    if (!bindSurface(si, bi, err)) {
+      surfaces_.pop_back();
+      surfaceIdxToBuf_.pop_back();
+      return false;
+    }
+    return true;
+  }
+
+  bool shrinkPool(int surfaceIdx, std::string& err) override {
+    if (surfaceIdx < 0 || surfaceIdx >= (int)surfaces_.size()) {
+      err = "bad surface index";
+      return false;
+    }
+    Surface& sf = surfaces_[surfaceIdx];
+    if (sf.state != Surface::State::Free) {
+      err = "surface not FREE";
+      return false;
+    }
+    int bi = surfaceIdxToBuf_[surfaceIdx];
+    if (bi >= 0 && outBufs_[bi].queued) {
+      err = "OUTPUT buffer still queued in driver";
+      return false;
+    }
+    // The buffer stays mapped and reserved (REQBUFS semantics); it simply
+    // stops being queued until a later growPool() reactivates it.
+    sf.state = Surface::State::Retired;
+    surfaceIdxToBuf_[surfaceIdx] = -1;
+    return true;
+  }
 
   bool submit(int surfaceIdx, uint64_t seq, int64_t ptsUs,
               std::string& err) override {
@@ -584,7 +646,7 @@ class V4l2Encoder : public IEncoder {
     return true;
   }
 
-  bool mapBuffers(std::string& err) {
+  bool mapBuffers(int activeCount, std::string& err) {
     // OUTPUT
     for (size_t bi = 0; bi < outBufs_.size(); bi++) {
       v4l2_buffer buf;
@@ -647,75 +709,80 @@ class V4l2Encoder : public IEncoder {
         }
       }
     }
-    // Build surfaces bound 1:1 to OUTPUT buffers.
-    surfaces_.resize(outBufs_.size());
-    surfaceIdxToBuf_.assign(outBufs_.size(), -1);
-    for (size_t si = 0; si < surfaces_.size(); si++) {
-      Surface& sf = surfaces_[si];
-      sf.index = (int)si;
-      sf.fmt = fmt_.fmt;
-      sf.visibleW = fmt_.visibleW;
-      sf.visibleH = fmt_.visibleH;
-      sf.codedW = fmt_.codedW;
-      sf.codedH = fmt_.codedH;
-      sf.deviceMemory = true;
-      sf.planeCount = (int)outBufs_[si].planes;
-      OutBinding& b = outBufs_[si];
-      if (fmt_.fmt == PixFmt::NV12 && b.planes >= 2) {
-        sf.refs.p[0] = (uint8_t*)b.addr[0];
-        sf.refs.p[1] = (uint8_t*)b.addr[1];
-        sf.refs.p[2] = nullptr;
-        sf.refs.stride[0] = fmt_.stride0;
+    // Build surfaces bound 1:1 to the first `activeCount` OUTPUT buffers;
+    // the rest stay reserved for elastic growPool().
+    surfaces_.resize(activeCount);
+    surfaceIdxToBuf_.assign(activeCount, -1);
+    for (int si = 0; si < activeCount; si++)
+      if (!bindSurface(si, si, err)) return false;
+    return true;
+  }
+
+  bool bindSurface(int si, int bi, std::string& err) {
+    Surface& sf = surfaces_[si];
+    sf.index = si;
+    sf.fmt = fmt_.fmt;
+    sf.visibleW = fmt_.visibleW;
+    sf.visibleH = fmt_.visibleH;
+    sf.codedW = fmt_.codedW;
+    sf.codedH = fmt_.codedH;
+    sf.deviceMemory = true;
+    sf.planeCount = (int)outBufs_[bi].planes;
+    OutBinding& b = outBufs_[bi];
+    if (fmt_.fmt == PixFmt::NV12 && b.planes >= 2) {
+      sf.refs.p[0] = (uint8_t*)b.addr[0];
+      sf.refs.p[1] = (uint8_t*)b.addr[1];
+      sf.refs.p[2] = nullptr;
+      sf.refs.stride[0] = fmt_.stride0;
+      sf.refs.stride[1] = fmt_.stride1;
+      sf.planeBytes[0] = b.lengths[0];
+      sf.planeBytes[1] = b.lengths[1];
+    } else if (fmt_.fmt == PixFmt::I420 && b.planes >= 3) {
+      sf.refs.p[0] = (uint8_t*)b.addr[0];
+      sf.refs.p[1] = (uint8_t*)b.addr[1];
+      sf.refs.p[2] = (uint8_t*)b.addr[2];
+      sf.refs.stride[0] = fmt_.stride0;
+      sf.refs.stride[1] = fmt_.stride1;
+      sf.refs.stride[2] = fmt_.stride2;
+      sf.planeBytes[0] = b.lengths[0];
+      sf.planeBytes[1] = b.lengths[1];
+      sf.planeBytes[2] = b.lengths[2];
+    } else if (b.planes == 1) {
+      // Single-planar: derive plane offsets from the negotiated strides.
+      uint8_t* base = (uint8_t*)b.addr[0];
+      size_t yBytes = (size_t)fmt_.stride0 * fmt_.codedH;
+      sf.refs.p[0] = base;
+      sf.refs.stride[0] = fmt_.stride0;
+      sf.planeBytes[0] = yBytes;
+      if (fmt_.fmt == PixFmt::NV12) {
+        sf.refs.p[1] = base + yBytes;
         sf.refs.stride[1] = fmt_.stride1;
-        sf.planeBytes[0] = b.lengths[0];
-        sf.planeBytes[1] = b.lengths[1];
-      } else if (fmt_.fmt == PixFmt::I420 && b.planes >= 3) {
-        sf.refs.p[0] = (uint8_t*)b.addr[0];
-        sf.refs.p[1] = (uint8_t*)b.addr[1];
-        sf.refs.p[2] = (uint8_t*)b.addr[2];
-        sf.refs.stride[0] = fmt_.stride0;
-        sf.refs.stride[1] = fmt_.stride1;
-        sf.refs.stride[2] = fmt_.stride2;
-        sf.planeBytes[0] = b.lengths[0];
-        sf.planeBytes[1] = b.lengths[1];
-        sf.planeBytes[2] = b.lengths[2];
-      } else if (b.planes == 1) {
-        // Single-planar: derive plane offsets from the negotiated strides.
-        uint8_t* base = (uint8_t*)b.addr[0];
-        size_t yBytes = (size_t)fmt_.stride0 * fmt_.codedH;
-        sf.refs.p[0] = base;
-        sf.refs.stride[0] = fmt_.stride0;
-        sf.planeBytes[0] = yBytes;
-        if (fmt_.fmt == PixFmt::NV12) {
-          sf.refs.p[1] = base + yBytes;
-          sf.refs.stride[1] = fmt_.stride1;
-          sf.planeBytes[1] = std::min(b.lengths[0] - yBytes,
-                                      (size_t)fmt_.stride1 * (fmt_.codedH / 2));
-          if (b.lengths[0] < yBytes + sf.planeBytes[1]) {
-            err = "单平面 NV12 缓冲区小于协商步幅所需大小";
-            return false;
-          }
-        } else {
-          size_t uvBytes = (size_t)fmt_.stride1 * (fmt_.codedH / 2);
-          sf.refs.p[1] = base + yBytes;
-          sf.refs.p[2] = base + yBytes + uvBytes;
-          sf.refs.stride[1] = fmt_.stride1;
-          sf.refs.stride[2] = fmt_.stride2;
-          sf.planeBytes[1] = uvBytes;
-          sf.planeBytes[2] = uvBytes;
-          if (b.lengths[0] < yBytes + 2 * uvBytes) {
-            err = "单平面 YUV420 缓冲区小于协商步幅所需大小";
-            return false;
-          }
+        sf.planeBytes[1] = std::min(b.lengths[0] - yBytes,
+                                    (size_t)fmt_.stride1 * (fmt_.codedH / 2));
+        if (b.lengths[0] < yBytes + sf.planeBytes[1]) {
+          err = "单平面 NV12 缓冲区小于协商步幅所需大小";
+          return false;
         }
       } else {
-        err = "格式 " + fmt_.pixTag + " 出现意外平面数 " + std::to_string(b.planes);
-        return false;
+        size_t uvBytes = (size_t)fmt_.stride1 * (fmt_.codedH / 2);
+        sf.refs.p[1] = base + yBytes;
+        sf.refs.p[2] = base + yBytes + uvBytes;
+        sf.refs.stride[1] = fmt_.stride1;
+        sf.refs.stride[2] = fmt_.stride2;
+        sf.planeBytes[1] = uvBytes;
+        sf.planeBytes[2] = uvBytes;
+        if (b.lengths[0] < yBytes + 2 * uvBytes) {
+          err = "单平面 YUV420 缓冲区小于协商步幅所需大小";
+          return false;
+        }
       }
-      sf.totalBytes = sf.planeBytes[0] + sf.planeBytes[1] + sf.planeBytes[2];
-      sf.state = Surface::State::Free;
-      surfaceIdxToBuf_[si] = (int)si;
+    } else {
+      err = "格式 " + fmt_.pixTag + " 出现意外平面数 " + std::to_string(b.planes);
+      return false;
     }
+    sf.totalBytes = sf.planeBytes[0] + sf.planeBytes[1] + sf.planeBytes[2];
+    sf.state = Surface::State::Free;
+    surfaceIdxToBuf_[si] = bi;
     return true;
   }
 
@@ -959,6 +1026,7 @@ class V4l2Encoder : public IEncoder {
       return 0;
     }
     Surface& sf = surfaces_[si];
+    (void)sf;  // state machine is owned by the session; see SurfaceReleased
     EncoderEvent ev;
     ev.type = EncoderEvent::Type::SurfaceReleased;
     ev.surfaceIndex = si;
@@ -967,10 +1035,6 @@ class V4l2Encoder : public IEncoder {
     if (buf.flags & V4L2_BUF_FLAG_ERROR)
       ev.detail = "OUTPUT 缓冲被标记 ERROR；";
     b.heldSeq = UINT64_MAX;
-    if (sf.state == Surface::State::Queued) {
-      sf.state = Surface::State::Free;
-      sf.reuseCount++;
-    }
     out.push_back(std::move(ev));
     if (eosRequested_ && queuedOutputs_ == 0) {
       // Nothing left in the driver on the input side.

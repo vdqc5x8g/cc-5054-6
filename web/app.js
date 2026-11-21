@@ -8,6 +8,9 @@ const MODE_HINTS = {
   late: "延迟回执：硬件仍在读取表面时不得改写，池会被占满，送帧必须等待回执（服务端为软件模型加入的定时延迟，非设备时延）。",
   guard: "所有权守卫：对仍被编码器持有的表面尝试写入必须被拒绝；界面展示拒绝计数。",
   corrupt: "注入故障：故意破坏其中一帧的帧号标记，验证解码核对能发现错误而不是盲目通过。",
+  earlyreuse:
+    "提前复用：构造“输出包已可读、输入表面仍未获准回收”的交错，在扫描中途改写仍在读的表面；" +
+    "逐帧角标会让解码画面留下可识别的串帧。软件模型用读延迟+分条扫描模拟，非设备时序。",
 };
 
 const state = {
@@ -19,6 +22,7 @@ const state = {
   imgBusy: false,
   lastKey: "",
   imageSeq: { src: null, out: null },
+  ab: null, // {phase:"a"|"b"|"done", a:snap, b:snap}
 };
 
 function fmtMs(v) {
@@ -104,13 +108,14 @@ function renderCapsHint() {
   let html = "";
   if (backend === "v4l2" && d.v4l2Available) {
     html += `<div><b>硬件后端</b>：使用真实 V4L2 memory-to-memory 接口，格式由 S_FMT 协商，步幅取自 G_FMT。</div>`;
-    html += `<div><b>表面释放</b>：仅当 DQBUF(OUTPUT) 返回缓冲后才发 SurfaceReleased；在此之前禁止改写。</div>`;
+    html += `<div><b>表面释放</b>：仅当 DQBUF(OUTPUT) 返回缓冲后才发 SurfaceReleased；在此之前禁止改写。弹性扩缩通过 REQBUFS 预留缓冲的激活/休眠实现。</div>`;
+    html += `<div><b>时序来源</b>：来自真实编码设备的结论会标记为“设备实测”。</div>`;
   } else if (backend === "v4l2") {
     html += `<div><b>硬件不可用</b>：本机未发现可用的 V4L2 M2M H.264 节点（${esc(d.v4l2Reason || "")}）。</div>`;
     html += `<div>请切换到 OpenH264 软件对照运行；软件路径会明确标记为“硬件未覆盖”，不会伪造硬件测速。</div>`;
   } else {
     html += `<div><b>软件对照</b>：真实 OpenH264 编码与独立解码核对，用于验证整条送帧链路；<b>不是</b>硬件吞吐量测量。</div>`;
-    html += `<div>该后端也是异步回执的接口模型：码流同步可得，输入表面按“延迟回执”方式释放，用于演示背压与所有权约束。</div>`;
+    html += `<div>该后端也是异步回执的接口模型：读延迟 / 扫描时长 / 回执延迟都是<b>可控回调</b>，用于在缺少设备时测试所有权与调度规则；所有时序一律标记为“软件模型模拟”。</div>`;
   }
   const sw = d.software;
   if (sw) html += `<div><b>软件编码器</b>：${esc(sw.name)}</div>`;
@@ -121,6 +126,7 @@ function readConfig() {
   const [w, h] = $("fSize").value.split("x").map(Number);
   const backend = $("fBackend").value;
   const mode = $("fMode").value;
+  const [sw, sh] = $("fSwitchSize").value.split("x").map(Number);
   return {
     backend,
     mode,
@@ -132,19 +138,35 @@ function readConfig() {
     pool: Number($("fPool").value),
     frames: Number($("fFrames").value),
     verify: 1,
-    receiptLagMs: mode === "late" ? Number($("fLag").value) : 0,
+    receiptLagMs: mode === "late" || mode === "earlyreuse" ? Number($("fLag").value) : 0,
     device: backend === "v4l2" ? $("fDevice").value : "",
     format: $("fFormat").value,
+    sched: $("fSched").value,
+    poolMin: Number($("fPoolMin").value),
+    poolMax: Number($("fPoolMax").value),
+    readDelayMs: Number($("fReadDelay").value),
+    scanMs: Number($("fScan").value),
+    step: $("fStep").checked ? 1 : 0,
+    order: $("fOrder").value,
+    script: $("fScript").value.trim(),
+    switchAt: Number($("fSwitchAt").value),
+    switchW: sw,
+    switchH: sh,
   };
 }
+
+const CONFIG_INPUTS = [
+  "fBackend", "fMode", "fSize", "fFps", "fBitrate", "fGop", "fPool", "fFrames",
+  "fDevice", "fFormat", "fSched", "fPoolMin", "fPoolMax", "fReadDelay", "fScan",
+  "fOrder", "fStep", "fScript", "fSwitchAt", "fSwitchSize",
+];
 
 function setRunning(running) {
   $("btnStart").disabled = running;
   $("btnStop").disabled = !running;
-  for (const id of ["fBackend", "fMode", "fSize", "fFps", "fBitrate", "fGop", "fPool", "fFrames", "fDevice", "fFormat"]) {
-    $(id).disabled = running;
-  }
-  $("fLag").disabled = running || $("fMode").value !== "late";
+  for (const id of CONFIG_INPUTS) $(id).disabled = running;
+  $("fLag").disabled =
+    running || ($("fMode").value !== "late" && $("fMode").value !== "earlyreuse");
 }
 
 async function start() {
@@ -167,6 +189,94 @@ async function stop() {
   try { await api("/api/stop", { method: "POST" }); } catch (e) { console.error(e); }
 }
 
+async function step(kind) {
+  try {
+    await api("/api/step?kind=" + kind + "&n=1", { method: "POST" });
+  } catch (e) {
+    $("gatePending").textContent = "步进失败：" + e.message;
+  }
+  pollNow();
+}
+
+async function continueRun() {
+  try { await api("/api/continue", { method: "POST" }); } catch (e) { console.error(e); }
+  pollNow();
+}
+
+function replayTrace() {
+  const snap = state.latest;
+  if (!snap || !snap.trace) return;
+  $("fScript").value = snap.trace;
+  $("fStep").checked = false;
+  start();
+}
+
+// A/B 轨迹对照：同一份配置分别按“产包优先 / 归还优先”各跑一次，比较内存峰值、
+// 阻塞时长与错误角标。两次运行都在服务端完整执行，结果如实展示。
+async function runAB() {
+  if (state.ab && (state.ab.phase === "a" || state.ab.phase === "b")) return;
+  const base = readConfig();
+  base.step = 0;
+  base.script = "";
+  state.ab = { phase: "a", a: null, b: null };
+  $("btnAB").disabled = true;
+  const waitDone = async () => {
+    for (;;) {
+      const s = await api("/api/state");
+      if (s.status === "completed" || s.status === "failed" || s.status === "stopped") return s;
+      await new Promise((r) => setTimeout(r, 300));
+    }
+  };
+  try {
+    const qA = new URLSearchParams({ ...base, order: "packet" }).toString();
+    await api("/api/start?" + qA, { method: "POST" });
+    $("abResult").innerHTML = '<span class="meta">A/B 对照：轨迹 A（产包优先）运行中…</span>';
+    state.ab.a = await waitDone();
+    state.ab.phase = "b";
+    const qB = new URLSearchParams({ ...base, order: "return" }).toString();
+    await api("/api/start?" + qB, { method: "POST" });
+    $("abResult").innerHTML = '<span class="meta">A/B 对照：轨迹 B（归还优先）运行中…</span>';
+    state.ab.b = await waitDone();
+    state.ab.phase = "done";
+    renderAB();
+  } catch (e) {
+    $("abResult").innerHTML = '<span class="meta">A/B 对照失败：' + esc(e.message) + "</span>";
+    state.ab = null;
+  } finally {
+    $("btnAB").disabled = false;
+    pollNow();
+  }
+}
+
+function renderAB() {
+  const ab = state.ab;
+  if (!ab || !ab.a || !ab.b) return;
+  const row = (label, fa, fb, warn) =>
+    `<tr><td>${label}</td><td>${fa}</td><td>${fb}</td>${warn ? `<td>${warn}</td>` : "<td></td>"}</tr>`;
+  const ma = ab.a.metrics, mb = ab.b.metrics;
+  const tag = (s) => (s.timingSource === "device" ? "设备实测" : "软件模型模拟");
+  $("abResult").innerHTML = `
+    <table class="ab-table">
+      <thead><tr><th>对照项</th><th>A · 产包事件优先</th><th>B · 归还事件优先</th><th></th></tr></thead>
+      <tbody>
+        ${row("内存峰值 RSS", ma.peakRssKb + " KB", mb.peakRssKb + " KB")}
+        ${row("峰值映射字节", fmtBytes(ma.peakMappedBytes), fmtBytes(mb.peakMappedBytes))}
+        ${row("峰值活跃表面", ma.peakActiveSurfaces, mb.peakActiveSurfaces)}
+        ${row("阻塞次数 / 时长", ma.backpressureStalls + " 次 / " + fmtMs(ma.stallMsTotal),
+              mb.backpressureStalls + " 次 / " + fmtMs(mb.stallMsTotal))}
+        ${row("错误角标 / 串帧", ma.cornerMismatches + " / " + ma.mixedFrames,
+              mb.cornerMismatches + " / " + mb.mixedFrames,
+              ma.mixedFrames || mb.mixedFrames ? "出现串帧" : "")}
+        ${row("链路验收", ab.a.pipelineVerified ? "通过" : "未通过",
+              ab.b.pipelineVerified ? "通过" : "未通过")}
+        ${row("时序来源", tag(ab.a), tag(ab.b))}
+        ${row("调度轨迹", '<code class="trace">' + esc((ab.a.trace || "").slice(0, 40)) + "…</code>",
+              '<code class="trace">' + esc((ab.b.trace || "").slice(0, 40)) + "…</code>")}
+      </tbody>
+    </table>
+    <div class="meta">两条轨迹都可复制到“重放脚本”逐事件复跑；轨迹字符串见上方“调度轨迹”。</div>`;
+}
+
 function statusChip(el, text, cls) {
   el.textContent = text;
   el.className = "chip " + cls;
@@ -181,6 +291,42 @@ function stateChip(s) {
     case "stopped": return ["已停止", "chip-warn"];
     default: return ["空闲", "chip-muted"];
   }
+}
+
+function renderGate(snap) {
+  const active = snap.status === "running" || snap.status === "draining";
+  const stepping = active && snap.stepMode;
+  $("btnStepP").disabled = !stepping || !snap.pendingPackets;
+  $("btnStepR").disabled = !stepping || !snap.pendingReturns;
+  $("btnStepA").disabled = !stepping || (!snap.pendingPackets && !snap.pendingReturns);
+  $("btnContinue").disabled = !stepping;
+  $("gatePending").textContent =
+    `待放行：产包 ${snap.pendingPackets || 0} · 归还 ${snap.pendingReturns || 0}` +
+    (snap.stepMode ? "（单步模式，事件需手动放行）" : "");
+  $("gateScript").textContent =
+    snap.scriptLen ? `重放脚本 ${snap.scriptPos}/${snap.scriptLen}` : "";
+  $("gateTrace").textContent = snap.trace || "—";
+  $("btnReplay").disabled = !snap.trace || active;
+}
+
+function renderGenerations(snap) {
+  const gens = snap.generations || [];
+  const box = $("genCards");
+  if (!gens.length) {
+    box.innerHTML = "";
+    return;
+  }
+  box.innerHTML = gens
+    .map(
+      (g) => `<div class="gen-card gen-${esc(g.state)}">
+        <span class="gen-title">代次 #${g.id}</span>
+        <span>${g.width}×${g.height}</span>
+        <span>状态 <b>${esc(g.state)}</b></span>
+        <span>表面 <b>${g.surfaces}</b>（空闲 ${g.freeSurfaces}）</span>
+        <span>映射 <b>${fmtBytes(g.bytes)}</b></span>
+      </div>`
+    )
+    .join("");
 }
 
 function renderSurfaces(snap) {
@@ -199,7 +345,7 @@ function renderSurfaces(snap) {
       const dev = s.deviceMemory ? "设备映射" : "主机内存";
       return `<div class="surf-card">
         <div class="sc-head">
-          <span class="sc-title">Surface ${s.index}</span>
+          <span class="sc-title">Surface ${s.index} <span class="gen-badge">代次 #${s.gen}</span></span>
           <span class="sc-state ${esc(s.state)}">${esc(s.state)}</span>
         </div>
         <div class="sc-cells">
@@ -220,6 +366,15 @@ function renderSurfaces(snap) {
     .join("");
 }
 
+function cornerCell(f) {
+  if (!f.bitstreamReady || f.cornerValid === 0) return "—";
+  const tags = (f.cornerTags || []).join(",");
+  const cls = f.cornersMixed ? "corner-mixed" : f.cornersOk ? "corner-ok" : "corner-bad";
+  const mark = f.cornersMixed ? "串帧!" : f.cornersOk ? "✓" : "✗";
+  return `<span class="${cls}" title="期望 ${f.cornerExpected}，有效角 ${f.cornerValid}/4">` +
+    `[${tags}] ${mark}</span>`;
+}
+
 function renderFrames(snap) {
   const frames = snap.frames || [];
   const tbody = $("frameTable").querySelector("tbody");
@@ -227,6 +382,7 @@ function renderFrames(snap) {
   $("frameSummary").textContent =
     `提交 ${m.submitted || 0} · 码流 ${m.bitstreams || 0} · 核对通过 ${m.verified || 0}` +
     (m.detected ? ` · 检出故障 ${m.detected}` : "") +
+    (m.mixedFrames ? ` · 串帧 ${m.mixedFrames}` : "") +
     ` · 失败 ${m.failed || 0} · 乱序 ${m.outOfOrder || 0}`;
 
   const sel = $("frameSel");
@@ -250,7 +406,7 @@ function renderFrames(snap) {
   }
 
   if (!frames.length) {
-    tbody.innerHTML = '<tr><td colspan="11" class="meta">尚无帧。</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="13" class="meta">尚无帧。</td></tr>';
     return;
   }
   const rows = frames.slice(-160).reverse();
@@ -260,9 +416,11 @@ function renderFrames(snap) {
       return `<tr>
         <td>${f.seq}</td>
         <td class="st-${esc(f.status)}">${esc(f.status)}${f.corrupted ? " ⚠" : ""}</td>
+        <td>#${f.gen}</td>
         <td>${f.surfaceIndex >= 0 ? f.surfaceIndex : "—"}</td>
         <td>${f.bitstreamReady ? f.auBytes + " B" + (f.keyframe ? " · I" : "") : "—"}</td>
         <td>${f.markerExpected} / ${seqShown}</td>
+        <td>${cornerCell(f)}</td>
         <td>${flag(f.patchesOk)}</td>
         <td>${flag(f.colorsOk)}</td>
         <td>${f.psnrMae >= 0 ? f.psnrMae.toFixed(2) : "—"}</td>
@@ -280,12 +438,15 @@ function flag(v) {
 
 function renderMetrics(snap) {
   const m = snap.metrics || {};
-  const cap = snap.caps || {};
-  const sw = snap.config.backend === "openh264";
+  const sched = snap.config.sched === "elastic" ? "弹性" : "固定";
   const cells = [
-    ["表面池", snap.surfaces.length + " 个", "", "有限池，" + fmtBytes(snap.mappedBytes)],
+    ["表面池", snap.surfaces.length + " 个", "", sched + "调度，" + fmtBytes(snap.mappedBytes)],
     ["最大在途", m.maxInFlight ?? 0, "", "受池大小约束"],
+    ["峰值活跃表面", m.peakActiveSurfaces ?? 0, "", "含各代次叠加"],
+    ["峰值映射字节", fmtBytes(m.peakMappedBytes), "", "各代次池内存峰值"],
     ["背压等待", m.backpressureStalls || 0, m.backpressureStalls ? "warn" : "", "累计 " + fmtMs(m.stallMsTotal)],
+    ["弹性 增/缩/等", (m.grows || 0) + " / " + (m.shrinks || 0) + " / " + (m.schedWaits || 0),
+      m.grows || m.shrinks ? "warn" : "", "归还反馈驱动的扩缩"],
     ["提交→码流 p50", fmtMs(m.p50SubmitToAuMs), "", "最大 " + fmtMs(m.maxSubmitToAuMs)],
     ["提交→可复用 p50", fmtMs(m.p50SubmitToReleaseMs), "", "最大 " + fmtMs(m.maxSubmitToReleaseMs)],
     ["码流 / 提交", (m.bitstreams || 0) + " / " + (m.submitted || 0), "", "每帧一个访问单元"],
@@ -294,6 +455,10 @@ function renderMetrics(snap) {
     ["乱序 / 重复", (m.outOfOrder || 0) + " / " + (m.duplicateSeq || 0), m.outOfOrder ? "bad" : "good", "按帧号回映"],
     ["解码错误", m.decodeErrors || 0, m.decodeErrors ? "bad" : "good", "独立解码器"],
     ["帧号不符", m.markerMismatches || 0, m.markerMismatches ? "warn" : "good", "标记块核对"],
+    ["错误角标", m.cornerMismatches || 0, m.cornerMismatches ? "warn" : "good", "四角标与帧号不符"],
+    ["串帧", m.mixedFrames || 0, m.mixedFrames ? "bad" : "good", "同帧四角标不一致"],
+    ["越权写入", m.ownershipViolations || 0, m.ownershipViolations ? "bad" : "good", "提前复用注入"],
+    ["跨代次迟到归还", m.staleGenReleases || 0, m.staleGenReleases ? "warn" : "good", "旧代次晚于新池同号分配"],
     ["画面不符", m.pictureMismatches || 0, m.pictureMismatches ? "bad" : "good", "MAE 阈值 12"],
     ["RSS 基线 / 峰值", (m.baselineRssKb || 0) + " / " + (m.peakRssKb || 0) + " KB", "", "进程常驻内存"],
     ["EOS 排空", snap.eosComplete ? "完成" : snap.eosRequested ? "进行中" : "—", snap.eosComplete ? "good" : "", "共 " + (snap.framesDrained || 0) + " 帧"],
@@ -314,6 +479,7 @@ function renderVerdict(snap) {
   $("vCreated").textContent = "会话创建：" + (created ? "成功" : "—");
   const pipe = $("vPipeline");
   const hw = $("vHardware");
+  const tm = $("vTiming");
   if (snap.status === "running" || snap.status === "draining" || snap.status === "starting") {
     pipe.textContent = "链路：运行中";
     pipe.className = "tag warn";
@@ -334,7 +500,15 @@ function renderVerdict(snap) {
     hw.textContent = "硬件覆盖：未覆盖";
     hw.className = "tag warn";
   }
+  if (snap.timingSource === "device") {
+    tm.textContent = "时序：设备实测";
+    tm.className = "tag ok";
+  } else {
+    tm.textContent = "时序：软件模型模拟";
+    tm.className = "tag warn";
+  }
   $("vNote").textContent = snap.verificationNote || snap.error || "尚未运行。";
+  $("vCapacity").textContent = snap.capacityHint || "";
 }
 
 function renderLog(snap) {
@@ -348,10 +522,17 @@ function renderLog(snap) {
 function frameInfo(snap, seq) {
   const f = (snap.frames || []).find((x) => x.seq === seq);
   if (!f) return "";
+  const corner =
+    f.cornerValid > 0
+      ? `<span>角标 <b>[${(f.cornerTags || []).join(",")}]</b> 期望 ${f.cornerExpected}` +
+        (f.cornersMixed ? " <b class='corner-mixed'>串帧</b>" : "") + "</span>"
+      : "";
   return [
     `<span>帧号 <b>${f.seq}</b></span>`,
+    `<span>代次 <b>#${f.gen}</b></span>`,
     `<span>状态 <b>${esc(f.status)}</b></span>`,
     `<span>标记 期望/实际 <b>${f.markerExpected} / ${f.markerDecoded}</b></span>`,
+    corner,
     `<span>色块 <b>${f.patchesOk ? "✓" : "✗"}</b></span>`,
     `<span>颜色 <b>${f.colorsOk ? "✓" : "✗"}</b></span>`,
     `<span>MAE <b>${f.psnrMae >= 0 ? f.psnrMae.toFixed(2) : "—"}</b></span>`,
@@ -404,11 +585,17 @@ function applySnapshot(snap) {
   statusChip($("chipStatus"), stText, stCls);
   statusChip($("chipBackend"), snap.caps && snap.caps.displayName ? truncate(snap.caps.displayName, 38) : "后端 —", "chip-muted");
   statusChip($("chipCoverage"), snap.hardwareCovered ? "真实硬件" : "硬件未覆盖", snap.hardwareCovered ? "chip-good" : "chip-warn");
+  statusChip(
+    $("chipTiming"),
+    snap.timingSource === "device" ? "时序：设备实测" : "时序：软件模拟",
+    snap.timingSource === "device" ? "chip-good" : "chip-warn"
+  );
 
-  const active = snap.status === "running" || snap.status === "draining" || snap.status === "starting" || snap.status === "completed";
   setRunning(snap.status === "running" || snap.status === "draining" || snap.status === "starting");
 
   renderVerdict(snap);
+  renderGate(snap);
+  renderGenerations(snap);
   renderSurfaces(snap);
   renderFrames(snap);
   renderMetrics(snap);
@@ -444,10 +631,19 @@ function loop() {
 function wire() {
   $("btnStart").addEventListener("click", start);
   $("btnStop").addEventListener("click", stop);
+  $("btnStepP").addEventListener("click", () => step("packet"));
+  $("btnStepR").addEventListener("click", () => step("return"));
+  $("btnStepA").addEventListener("click", () => step("any"));
+  $("btnContinue").addEventListener("click", continueRun);
+  $("btnReplay").addEventListener("click", replayTrace);
+  $("btnAB").addEventListener("click", runAB);
   $("fBackend").addEventListener("change", selectedBackendHint);
   $("fMode").addEventListener("change", () => {
-    $("fLag").disabled = $("fMode").value !== "late";
-    $("modeHint").textContent = MODE_HINTS[$("fMode").value] || "";
+    const v = $("fMode").value;
+    $("fLag").disabled = v !== "late" && v !== "earlyreuse";
+    if (v === "earlyreuse" && !Number($("fReadDelay").value)) $("fReadDelay").value = 40;
+    if (v === "earlyreuse" && !Number($("fScan").value)) $("fScan").value = 60;
+    $("modeHint").textContent = MODE_HINTS[v] || "";
   });
   $("btnLive").addEventListener("click", () => {
     state.follow = !state.follow;

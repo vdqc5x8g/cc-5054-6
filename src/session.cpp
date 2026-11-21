@@ -4,6 +4,7 @@
 #include <unordered_map>
 
 #include "png.h"
+#include "scheduler.h"
 
 namespace {
 
@@ -23,6 +24,15 @@ uint32_t crc32of(const std::vector<uint8_t>& d) {
       c = (c >> 1) ^ (0xEDB88320u & (uint32_t)(-(int32_t)(c & 1)));
   }
   return ~c;
+}
+
+char kindOf(const EncoderEvent& ev) {
+  switch (ev.type) {
+    case EncoderEvent::Type::BitstreamReady: return 'p';
+    case EncoderEvent::Type::SurfaceReleased: return 'r';
+    case EncoderEvent::Type::Fatal: return 'f';
+  }
+  return '?';
 }
 
 }  // namespace
@@ -78,7 +88,7 @@ bool Session::start(const SessionConfig& cfg, std::string& err) {
     return false;
   }
   if (c.mode != "paced" && c.mode != "burst" && c.mode != "late" &&
-      c.mode != "guard" && c.mode != "corrupt") {
+      c.mode != "guard" && c.mode != "corrupt" && c.mode != "earlyreuse") {
     err = "unknown send mode";
     return false;
   }
@@ -86,17 +96,74 @@ bool Session::start(const SessionConfig& cfg, std::string& err) {
     err = "receiptLag must be 0..2000 ms";
     return false;
   }
+  if (c.readDelayMs < 0 || c.readDelayMs > 2000 || c.scanMs < 0 ||
+      c.scanMs > 2000) {
+    err = "readDelay/scan must be 0..2000 ms";
+    return false;
+  }
   if (c.backend != "openh264" && c.backend != "v4l2") {
     err = "unknown backend";
     return false;
   }
+  if (c.sched != "fixed" && c.sched != "elastic") {
+    err = "unknown surface scheduler";
+    return false;
+  }
+  if (c.poolMin < 2 || c.poolMin > 8 || c.poolMax < 2 || c.poolMax > 8) {
+    err = "poolMin/poolMax must be 2..8";
+    return false;
+  }
+  if (c.sched == "elastic" && !(c.poolMin <= c.pool && c.pool <= c.poolMax)) {
+    err = "elastic scheduling needs poolMin <= pool <= poolMax";
+    return false;
+  }
+  if (c.order != "any" && c.order != "packet" && c.order != "return") {
+    err = "order must be any|packet|return";
+    return false;
+  }
+  for (char ch : c.script) {
+    if (ch != 'p' && ch != 'r') {
+      err = "script may only contain 'p' (packet) and 'r' (return)";
+      return false;
+    }
+  }
+  if (c.script.size() > 4096) {
+    err = "script too long";
+    return false;
+  }
+  if (c.switchAt >= 0) {
+    if (c.switchAt == 0 || c.switchAt >= c.frames) {
+      err = "switchAt must be within 1..frames-1";
+      return false;
+    }
+    if (c.switchWidth < 64 || c.switchWidth > 1920 || c.switchHeight < 64 ||
+        c.switchHeight > 1080 || c.switchWidth % 2 || c.switchHeight % 2) {
+      err = "switch resolution must be even and within 64..1920 x 64..1080";
+      return false;
+    }
+  }
+  if (c.mode == "earlyreuse" && c.frames < 2) {
+    err = "earlyreuse needs at least 2 frames";
+    return false;
+  }
+
+  // Harness defaults that make the intended interleavings exist.
   if (c.mode == "late" && c.receiptLagMs == 0) c.receiptLagMs = 120;
+  if (c.mode == "earlyreuse") {
+    if (c.receiptLagMs == 0) c.receiptLagMs = 120;
+    if (c.readDelayMs == 0) c.readDelayMs = 40;
+    if (c.scanMs == 0) c.scanMs = 60;
+  }
+  if (c.switchAt >= 0 && c.receiptLagMs == 0) c.receiptLagMs = 120;
+  if (c.receiptLagMs > 0 && c.readDelayMs > c.receiptLagMs)
+    c.readDelayMs = c.receiptLagMs;
 
   SessionSnapshot fresh;
   fresh.status = "starting";
   fresh.cfg = c;
   fresh.phase = "initialising";
   fresh.startedAtUs = nowUs();
+  fresh.stepMode = c.step;
 
   std::lock_guard<std::mutex> lk(mu_);
   cfg_ = c;
@@ -106,11 +173,20 @@ bool Session::start(const SessionConfig& cfg, std::string& err) {
   artifacts_.clear();
   artifactOrder_.clear();
   submitUs_.clear();
+  gens_.clear();
   m_ = RunMetrics();
   maxInFlightObserved_ = 0;
   latAu_.clear();
   latRel_.clear();
+  relLagMs_.clear();
   fatal_.clear();
+  pending_.clear();
+  tokens_.clear();
+  trace_.clear();
+  scriptPos_ = 0;
+  stepMode_ = c.step;
+  gateBlockedSince_ = -1;
+  overwritePending_ = false;
   stopFlag_ = false;
   workerDone_ = false;
   runStartUs_ = nowUs();
@@ -137,6 +213,45 @@ bool Session::join(int timeoutMs) {
   return true;
 }
 
+bool Session::stepEvents(const std::string& kind, int n, std::string& err) {
+  char k = 0;
+  if (kind == "packet") k = 'p';
+  else if (kind == "return") k = 'r';
+  else if (kind == "any") k = 'a';
+  else {
+    err = "kind must be packet|return|any";
+    return false;
+  }
+  if (n < 1 || n > 64) {
+    err = "n must be 1..64";
+    return false;
+  }
+  std::lock_guard<std::mutex> lk(mu_);
+  if (!stepMode_) {
+    err = "run is not in step mode";
+    return false;
+  }
+  if (workerDone_) {
+    err = "no run is active";
+    return false;
+  }
+  for (int i = 0; i < n; i++) tokens_.push_back(k);
+  return true;
+}
+
+void Session::continueRun() {
+  std::lock_guard<std::mutex> lk(mu_);
+  stepMode_ = false;
+  tokens_.clear();
+  if (scriptPos_ < cfg_.script.size()) {
+    scriptPos_ = cfg_.script.size();
+    logLine("手动继续：放弃剩余调度脚本，事件自由放行");
+  } else {
+    logLine("手动继续：退出单步，事件自由放行");
+  }
+  snap_.stepMode = false;
+}
+
 void Session::logLine(const std::string& s) {
   snap_.log.push_back(s);
   if (snap_.log.size() > 300) snap_.log.erase(snap_.log.begin());
@@ -146,6 +261,498 @@ FrameView* Session::frameFor(uint64_t seq) {
   if (seq < frames_.size()) return &frames_[seq];
   return nullptr;
 }
+
+// ---------------------------------------------------------------------------
+// Generations
+// ---------------------------------------------------------------------------
+
+bool Session::makeGeneration(int width, int height, std::string& err) {
+  auto g = std::unique_ptr<Generation>(new Generation());
+  g->id = (int)gens_.size();
+  g->width = width;
+  g->height = height;
+
+  EncoderSettings es;
+  es.width = width;
+  es.height = height;
+  es.fps = cfg_.fps;
+  es.bitrate = cfg_.bitrate;
+  es.gop = cfg_.gop;
+  es.pool = cfg_.pool;
+  es.poolMax = cfg_.sched == "elastic" ? cfg_.poolMax : 0;
+  es.format = cfg_.format;
+  es.device = cfg_.device;
+  bool sw = cfg_.backend != "v4l2";
+  es.receiptLagMs = sw ? cfg_.receiptLagMs : 0;
+  es.readDelayMs = sw ? cfg_.readDelayMs : 0;
+  es.scanMs = sw ? cfg_.scanMs : 0;
+
+  if (cfg_.backend == "v4l2")
+    g->enc = makeV4l2Encoder(es, err);
+  else
+    g->enc = makeOpenH264Encoder(es, err);
+  if (!g->enc) {
+    err = "后端构造失败：" + err;
+    return false;
+  }
+  if (!g->enc->createPool(cfg_.pool, err)) {
+    err = "无法分配所需表面：" + err;
+    return false;
+  }
+  g->caps = g->enc->caps();
+  g->format = g->enc->format();
+  g->layout.fmt = g->format.fmt;
+  g->layout.visibleW = g->format.visibleW;
+  g->layout.visibleH = g->format.visibleH;
+  g->layout.codedW = g->format.codedW;
+  g->layout.codedH = g->format.codedH;
+  g->layout.yStride = g->format.stride0;
+  g->layout.uvStride = g->format.stride1;
+  g->layout.uvRows = g->format.codedH / 2;
+  g->idleSinceUs.assign((size_t)g->enc->surfaceCount(), nowUs());
+
+  {
+    std::lock_guard<std::mutex> lk(mu_);
+    logLine("代次 " + std::to_string(g->id) + "：编码会话已创建（" +
+            g->caps.displayName + "，" + std::to_string(width) + "x" +
+            std::to_string(height) + "）");
+    for (int i = 0; i < g->enc->surfaceCount(); i++) {
+      Surface& s = g->enc->surface(i);
+      logLine("代次 " + std::to_string(g->id) + " 表面 " + std::to_string(i) +
+              "：" + pixFmtName(s.fmt) + " 可视 " + std::to_string(s.visibleW) +
+              "x" + std::to_string(s.visibleH) + " 编码区 " +
+              std::to_string(s.codedW) + "x" + std::to_string(s.codedH) +
+              " 步幅 " + std::to_string(s.refs.stride[0]) + "/" +
+              std::to_string(s.refs.stride[1]) + "/" +
+              std::to_string(s.refs.stride[2]) +
+              (s.deviceMemory ? " 设备映射" : " 主机内存") + "，" +
+              std::to_string(s.totalBytes) + " 字节");
+    }
+  }
+
+  if (cfg_.verify) {
+    std::string derr;
+    if (!g->dec.open(derr)) {
+      std::lock_guard<std::mutex> lk(mu_);
+      logLine("代次 " + std::to_string(g->id) +
+              " 解码器打开失败（" + derr + "），其帧无法做画面核对");
+    } else {
+      g->decoderOpen = true;
+    }
+  }
+
+  bool first = gens_.empty();
+  gens_.push_back(std::move(g));
+  if (first) {
+    std::lock_guard<std::mutex> lk(mu_);
+    Generation& cur = *gens_.back();
+    snap_.caps = cur.caps;
+    snap_.format = cur.format;
+    snap_.sessionCreated = true;
+    snap_.hardwareCovered = cur.caps.hardware;
+    snap_.timingSource = cur.caps.hardware ? "device" : "simulated";
+    snap_.verifyEnabled = cfg_.verify;
+    snap_.decoderOpen = cur.decoderOpen;
+    snap_.status = "running";
+    snap_.phase = "feeding frames";
+    logLine("会话创建并不等于送帧链路正确；下面分别检查提交、异步码流回执、解码核对与表面归还。");
+    logLine(std::string("表面调度器：") +
+            (cfg_.sched == "elastic"
+                 ? "弹性池（按归还反馈扩缩），初始 " + std::to_string(cfg_.pool) +
+                       "，下限 " + std::to_string(cfg_.poolMin) + "，上限 " +
+                       std::to_string(cfg_.poolMax)
+                 : "固定池，" + std::to_string(cfg_.pool) + " 个表面"));
+    if (cfg_.readDelayMs > 0 || cfg_.scanMs > 0)
+      logLine("延迟读取模型：提交后 " + std::to_string(cfg_.readDelayMs) +
+              " ms 开始扫描输入表面，扫描 " + std::to_string(cfg_.scanMs) +
+              " ms；扫描完成产包，" + std::to_string(cfg_.receiptLagMs) +
+              " ms 后才允许回收——构造“包已可读、表面未获准回收”的交错");
+    if (!cfg_.script.empty())
+      logLine("调度脚本重放：" + std::to_string(cfg_.script.size()) +
+              " 个事件（p=产包 r=归还），顺序由脚本强制");
+    else if (cfg_.order != "any")
+      logLine(std::string("事件顺序偏好：") +
+              (cfg_.order == "packet" ? "产包事件优先" : "归还事件优先"));
+    if (stepMode_)
+      logLine("单步模式：产包与归还事件需经界面逐个放行");
+  } else {
+    std::lock_guard<std::mutex> lk(mu_);
+    snap_.decoderOpen = gens_.back()->decoderOpen;
+  }
+  return true;
+}
+
+void Session::switchGeneration() {
+  Generation& old = cur();
+  {
+    std::string eerr;
+    old.enc->requestEos(eerr);
+  }
+  {
+    std::lock_guard<std::mutex> lk(mu_);
+    old.eosRequested = true;
+    logLine("分辨率切换：帧 " + std::to_string(cfg_.switchAt) + " 起改用 " +
+            std::to_string(cfg_.switchWidth) + "x" +
+            std::to_string(cfg_.switchHeight) +
+            "；旧代次 " + std::to_string(old.id) +
+            " 的资源仍在排空，归还按代次记账");
+  }
+  std::string err;
+  if (!makeGeneration(cfg_.switchWidth, cfg_.switchHeight, err)) {
+    std::lock_guard<std::mutex> lk(mu_);
+    finishRun("failed", "新分辨率建池失败：" + err);
+    return;
+  }
+  {
+    std::lock_guard<std::mutex> lk(mu_);
+    logLine("新代次 " + std::to_string(gens_.back()->id) +
+            " 已建池并开始送帧；旧代次表面在实际确认归还前不会释放");
+    updatePeaks();
+  }
+}
+
+void Session::closeGeneration(Generation& g) {
+  if (g.closed) return;
+  if (g.enc) g.enc->shutdown();
+  g.enc.reset();
+  g.dec.close();
+  g.decoderOpen = false;
+  g.closed = true;
+}
+
+// ---------------------------------------------------------------------------
+// Event pump and gate
+// ---------------------------------------------------------------------------
+
+void Session::pumpGeneration(Generation& g) {
+  if (g.closed || !g.enc) return;
+  std::vector<EncoderEvent> evs;
+  std::string perr;
+  int n = g.enc->poll(evs, 2, perr);
+  if (n < 0) {
+    std::lock_guard<std::mutex> lk(mu_);
+    fatal_ = perr;
+    logLine("后端轮询失败：" + perr);
+    return;
+  }
+  for (auto& ev : evs) {
+    if (ev.type == EncoderEvent::Type::Fatal) {
+      std::lock_guard<std::mutex> lk(mu_);
+      fatal_ = ev.detail;
+      logLine("后端致命错误：" + ev.detail);
+      continue;
+    }
+    PendingEv pe;
+    pe.ev = std::move(ev);
+    pe.gen = g.id;
+    pending_.push_back(std::move(pe));
+  }
+}
+
+bool Session::pumpAndGate() {
+  for (auto& g : gens_) pumpGeneration(*g);
+  std::lock_guard<std::mutex> lk(mu_);
+  int applied = applyGate();
+  updatePeaks();
+  return applied > 0;
+}
+
+bool Session::quiescent() const {
+  // No pending events, nothing in flight in any generation, and every
+  // generation has drained: the event the gate is waiting for cannot come.
+  if (!pending_.empty()) return false;
+  for (auto& gp : gens_) {
+    if (gp->closed) continue;
+    for (int i = 0; i < gp->enc->surfaceCount(); i++) {
+      Surface::State st = gp->enc->surface(i).state;
+      if (st == Surface::State::Queued || st == Surface::State::Filling)
+        return false;
+    }
+    if (gp->eosRequested && !gp->enc->eosComplete()) return false;
+  }
+  return true;
+}
+
+int Session::applyGate() {
+  // mu_ held by caller.
+  int applied = 0;
+  while (!pending_.empty()) {
+    char want = 0;
+    bool scripted = scriptPos_ < cfg_.script.size();
+    bool strict = false;
+    if (scripted) {
+      want = cfg_.script[scriptPos_];
+      strict = true;
+    } else if (stepMode_) {
+      if (tokens_.empty()) break;
+      want = tokens_.front();
+      strict = true;
+    } else if (cfg_.order == "packet") {
+      want = 'p';
+    } else if (cfg_.order == "return") {
+      want = 'r';
+    }
+    auto it = pending_.begin();
+    if (want == 'p' || want == 'r') {
+      it = std::find_if(pending_.begin(), pending_.end(),
+                        [&](const PendingEv& pe) {
+                          return kindOf(pe.ev) == want;
+                        });
+      if (it == pending_.end()) {
+        if (strict) {
+          // The wanted kind is not pending. If it can never arrive, stop
+          // waiting instead of deadlocking the schedule replay.
+          if (quiescent()) {
+            if (scripted) {
+              logLine("调度脚本等待的事件已不会出现，提前结束脚本（已放行 " +
+                      std::to_string(scriptPos_) + "/" +
+                      std::to_string(cfg_.script.size()) + "）");
+              scriptPos_ = cfg_.script.size();
+            }
+            tokens_.clear();
+            break;
+          }
+          if (gateBlockedSince_ < 0) gateBlockedSince_ = nowUs();
+          break;
+        }
+        it = pending_.begin();  // preference only: fall back to arrival order
+      }
+    }
+    gateBlockedSince_ = -1;
+    PendingEv pe = std::move(*it);
+    pending_.erase(it);
+    applyEvent(pe);
+    trace_ += kindOf(pe.ev);
+    if (scripted)
+      scriptPos_++;
+    else if (stepMode_ && !tokens_.empty())
+      tokens_.pop_front();
+    applied++;
+  }
+  // Publish gate view.
+  int pk = 0, rt = 0;
+  for (auto& pe : pending_)
+    if (kindOf(pe.ev) == 'p')
+      pk++;
+    else
+      rt++;
+  snap_.pendingPackets = pk;
+  snap_.pendingReturns = rt;
+  snap_.stepMode = stepMode_;
+  snap_.scriptPos = scriptPos_;
+  snap_.scriptLen = cfg_.script.size();
+  snap_.trace = trace_;
+  return applied;
+}
+
+void Session::applyEvent(PendingEv& pe) {
+  Generation* g = nullptr;
+  for (auto& gp : gens_)
+    if (gp->id == pe.gen) {
+      g = gp.get();
+      break;
+    }
+  if (!g || g->closed) {
+    logLine("代次 " + std::to_string(pe.gen) +
+            " 已销毁后才到达的事件被丢弃（这不应发生）");
+    return;
+  }
+  int64_t now = nowUs();
+  if (pe.ev.type == EncoderEvent::Type::BitstreamReady)
+    handleBitstream(pe.ev, *g, now);
+  else if (pe.ev.type == EncoderEvent::Type::SurfaceReleased)
+    handleRelease(pe.ev, *g, now);
+}
+
+// ---------------------------------------------------------------------------
+// Scheduler
+// ---------------------------------------------------------------------------
+
+namespace {
+int countState(IEncoder* enc, Surface::State want) {
+  int n = 0;
+  for (int i = 0; i < enc->surfaceCount(); i++)
+    if (enc->surface(i).state == want) n++;
+  return n;
+}
+int activeSurfaces(IEncoder* enc) {
+  int n = 0;
+  for (int i = 0; i < enc->surfaceCount(); i++)
+    if (enc->surface(i).state != Surface::State::Retired) n++;
+  return n;
+}
+}  // namespace
+
+double Session::expectedOldestWaitMsLocked(Generation& g) {
+  int64_t oldest = -1;
+  for (int i = 0; i < g.enc->surfaceCount(); i++) {
+    Surface& s = g.enc->surface(i);
+    if (s.state != Surface::State::Queued || s.heldSeq == UINT64_MAX) continue;
+    auto it = submitUs_.find(s.heldSeq);
+    if (it != submitUs_.end())
+      oldest = oldest < 0 ? it->second : std::min(oldest, it->second);
+  }
+  if (oldest < 0) return -1;
+  double lagMs;
+  if (!relLagMs_.empty()) {
+    std::vector<double> copy = relLagMs_;
+    lagMs = percentile(copy, 0.5);
+  } else if (cfg_.receiptLagMs > 0) {
+    lagMs = (double)cfg_.receiptLagMs;
+  } else {
+    lagMs = 1000.0 / std::max(1, cfg_.fps);
+  }
+  double ageMs = (double)(nowUs() - oldest) / 1000.0;
+  return std::max(0.0, lagMs - ageMs);
+}
+
+bool Session::acquireSurface(Generation& g, int& idx, int64_t) {
+  idx = -1;
+  int64_t stallStartUs = nowUs();
+  bool loggedWait = false;
+  bool loggedGrowFail = false;
+  const bool elastic = cfg_.sched == "elastic";
+  for (;;) {
+    {
+      std::lock_guard<std::mutex> lk(mu_);
+      for (int k = 0; k < g.enc->surfaceCount(); k++) {
+        if (g.enc->surface(k).state == Surface::State::Free) {
+          idx = k;
+          g.idleSinceUs[k] = 0;
+          return true;
+        }
+      }
+      if (elastic) {
+        SchedInput in;
+        in.active = activeSurfaces(g.enc.get());
+        in.poolMin = cfg_.poolMin;
+        in.poolMax = cfg_.poolMax;
+        in.freeCount = 0;
+        in.inFlight = countState(g.enc.get(), Surface::State::Queued);
+        in.framePeriodMs = 1000.0 / std::max(1, cfg_.fps);
+        in.oldestWaitMs = expectedOldestWaitMsLocked(g);
+        SchedDecision d = decideAcquire(in, true);
+        if (d.act == SchedAct::Grow) {
+          std::string gerr;
+          if (g.enc->growPool(gerr)) {
+            int ni = g.enc->surfaceCount() - 1;
+            g.idleSinceUs.push_back(0);
+            m_.grows++;
+            logLine("弹性增长 → " + std::to_string(activeSurfaces(g.enc.get())) +
+                    " 个活跃表面：" + d.why);
+            idx = ni;
+            updatePeaks();
+            return true;
+          }
+          if (!loggedGrowFail) {
+            logLine("增长被后端拒绝（" + gerr + "），改为等待归还");
+            loggedGrowFail = true;
+          }
+          m_.schedWaits++;
+        } else {
+          m_.schedWaits++;
+          if (!loggedWait) {
+            logLine("弹性等待：" + d.why);
+            loggedWait = true;
+          }
+        }
+      }
+    }
+    if (stopFlag_.load()) return false;
+    // The earlyreuse overwrite is wall-clock armed; a starved acquire loop is
+    // exactly where the worker sits while the victim's scan window passes.
+    maybeInjectOverwrite(nowUs());
+    pumpAndGate();
+    if (!fatal_.empty()) return false;
+    if (!stepMode_ && cfg_.script.empty() &&
+        nowUs() - stallStartUs > 15000000) {
+      std::lock_guard<std::mutex> lk(mu_);
+      finishRun("failed",
+                "15 秒内没有任何表面归还（池已耗尽且回执停止）");
+      return false;
+    }
+  }
+}
+
+void Session::maybeShrink(Generation& g) {
+  // mu_ held by caller.
+  if (cfg_.sched != "elastic") return;
+  int active = activeSurfaces(g.enc.get());
+  if (active <= cfg_.poolMin) return;
+  int freeCount = countState(g.enc.get(), Surface::State::Free);
+  if (freeCount < 2) return;
+  int64_t now = nowUs();
+  int oldestIdx = -1;
+  int64_t oldestIdle = 0;
+  for (int i = 0; i < g.enc->surfaceCount(); i++) {
+    if (g.enc->surface(i).state != Surface::State::Free) continue;
+    int64_t since = g.idleSinceUs[i];
+    if (since <= 0) continue;
+    int64_t idle = now - since;
+    if (idle > oldestIdle) {
+      oldestIdle = idle;
+      oldestIdx = i;
+    }
+  }
+  if (oldestIdx < 0) return;
+  SchedInput in;
+  in.active = active;
+  in.poolMin = cfg_.poolMin;
+  in.poolMax = cfg_.poolMax;
+  in.freeCount = freeCount;
+  in.framePeriodMs = 1000.0 / std::max(1, cfg_.fps);
+  in.idleUs = oldestIdle;
+  SchedDecision d = decideRelease(in, true);
+  if (d.act != SchedAct::Shrink) return;
+  std::string serr;
+  if (g.enc->shrinkPool(oldestIdx, serr)) {
+    m_.shrinks++;
+    logLine("弹性收缩 → " + std::to_string(activeSurfaces(g.enc.get()) - 1) +
+            " 个活跃表面：表面 " + std::to_string(oldestIdx) + " 已退役（" +
+            d.why + "）");
+    updatePeaks();
+  } else {
+    logLine("收缩表面 " + std::to_string(oldestIdx) +
+            " 被后端拒绝：" + serr);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// earlyreuse fault injection
+// ---------------------------------------------------------------------------
+
+void Session::maybeInjectOverwrite(int64_t now) {
+  if (!overwritePending_ || now < overwriteAtUs_) return;
+  std::lock_guard<std::mutex> lk(mu_);
+  if (!overwritePending_) return;
+  overwritePending_ = false;
+  if (overwriteGen_ < 0 || overwriteGen_ >= (int)gens_.size()) return;
+  Generation& g = *gens_[overwriteGen_];
+  if (g.closed || overwriteSurface_ < 0 ||
+      overwriteSurface_ >= g.enc->surfaceCount())
+    return;
+  Surface& s = g.enc->surface(overwriteSurface_);
+  uint64_t victimSeq = overwritePlanSeq_ - 1;
+  if (s.state != Surface::State::Queued || s.heldSeq != victimSeq) {
+    logLine("故障注入窗口错过：表面 " + std::to_string(overwriteSurface_) +
+            " 已提前归还，本次无法构造提前复用（运行将按未检出判失败）");
+    return;
+  }
+  // The ownership violation itself: the backend is still scanning this
+  // surface for frame victimSeq, and we overwrite it with the next frame.
+  m_.ownershipViolations++;
+  FramePlan plan =
+      renderFrame(overwritePlanSeq_, g.width, g.height, false);
+  convertRgbToSurface(plan, g.layout, s.refs, s.planeBytes);
+  logLine("故障注入：表面 " + std::to_string(overwriteSurface_) +
+          " 在编码器仍持有（帧 " + std::to_string(victimSeq) +
+          " 读取进行中）时被覆写为帧 " + std::to_string(overwritePlanSeq_) +
+          " 的内容；若所有权被尊重，解码画面应出现可识别的串帧");
+}
+
+// ---------------------------------------------------------------------------
+// Worker
+// ---------------------------------------------------------------------------
 
 void Session::workerMain() {
   std::string err;
@@ -158,165 +765,66 @@ void Session::workerMain() {
       frames_[i].order = i;
     }
     logLine("开始运行：后端=" + cfg_.backend + "，送帧方式=" + cfg_.mode +
-            "，表面池=" + std::to_string(cfg_.pool) + "，帧数=" +
-            std::to_string(cfg_.frames));
+            "，调度器=" + cfg_.sched + "，表面池=" + std::to_string(cfg_.pool) +
+            "，帧数=" + std::to_string(cfg_.frames));
   }
 
-  EncoderSettings es;
-  es.width = cfg_.width;
-  es.height = cfg_.height;
-  es.fps = cfg_.fps;
-  es.bitrate = cfg_.bitrate;
-  es.gop = cfg_.gop;
-  es.pool = cfg_.pool;
-  es.format = cfg_.format;
-  es.device = cfg_.device;
-  es.receiptLagMs = cfg_.backend == "v4l2" ? 0 : cfg_.receiptLagMs;
-
-  if (cfg_.backend == "v4l2")
-    enc_ = makeV4l2Encoder(es, err);
-  else
-    enc_ = makeOpenH264Encoder(es, err);
-  if (!enc_) {
+  if (!makeGeneration(cfg_.width, cfg_.height, err)) {
     std::lock_guard<std::mutex> lk(mu_);
-    finishRun("failed", "后端构造失败：" + err);
+    finishRun("failed", err);
     return;
-  }
-  {
-    std::lock_guard<std::mutex> lk(mu_);
-    caps_ = enc_->caps();
-    snap_.caps = caps_;
-    snap_.sessionCreated = true;
-    snap_.hardwareCovered = caps_.hardware;
-    logLine("编码会话已创建：" + caps_.displayName);
-    logLine("会话创建并不等于送帧链路正确；下面分别检查提交、异步码流回执、解码核对与表面归还。");
-  }
-
-  if (!enc_->createPool(cfg_.pool, err)) {
-    std::lock_guard<std::mutex> lk(mu_);
-    snap_.caps = enc_->caps();
-    finishRun("failed", "无法分配所需表面：" + err);
-    closeEncoder();
-    return;
-  }
-  {
-    std::lock_guard<std::mutex> lk(mu_);
-    caps_ = enc_->caps();
-    snap_.caps = caps_;
-    format_ = enc_->format();
-    snap_.format = format_;
-    layout_.fmt = format_.fmt;
-    layout_.visibleW = format_.visibleW;
-    layout_.visibleH = format_.visibleH;
-    layout_.codedW = format_.codedW;
-    layout_.codedH = format_.codedH;
-    layout_.yStride = format_.stride0;
-    layout_.uvStride = format_.stride1;
-    layout_.uvRows = format_.codedH / 2;
-    size_t total = 0;
-    for (int i = 0; i < enc_->surfaceCount(); i++) {
-      Surface& s = enc_->surface(i);
-      total += s.totalBytes;
-      logLine("表面 " + std::to_string(i) + "：" + pixFmtName(s.fmt) +
-              " 可视 " + std::to_string(s.visibleW) + "x" +
-              std::to_string(s.visibleH) + " 编码区 " +
-              std::to_string(s.codedW) + "x" + std::to_string(s.codedH) +
-              " 步幅 " + std::to_string(s.refs.stride[0]) + "/" +
-              std::to_string(s.refs.stride[1]) + "/" +
-              std::to_string(s.refs.stride[2]) +
-              (s.deviceMemory ? " 设备映射" : " 主机内存") + "，" +
-              std::to_string(s.totalBytes) + " 字节");
-    }
-    m_.surfaceBytes = total;
-    snap_.mappedBytes = total;
-    snap_.status = "running";
-    snap_.phase = "feeding frames";
-    logLine("输出格式 " + format_.pixTag + "，编码区 " +
-            std::to_string(format_.codedW) + "x" +
-            std::to_string(format_.codedH) + "，步幅 " +
-            std::to_string(format_.stride0) + "/" +
-            std::to_string(format_.stride1) +
-            (format_.grantedDiffers
-                 ? "（驱动给出的编码区与请求不同，转换按实际步幅写入）"
-                 : ""));
-  }
-
-  if (cfg_.verify) {
-    snap_.verifyEnabled = true;
-    if (!dec_.open(err)) {
-      std::lock_guard<std::mutex> lk(mu_);
-      logLine("解码器打开失败（" + err + "），本次运行无法做画面核对");
-    } else {
-      std::lock_guard<std::mutex> lk(mu_);
-      snap_.decoderOpen = true;
-    }
   }
 
   const int64_t framePeriodUs = 1000000 / std::max(1, cfg_.fps);
   const bool paced = cfg_.mode == "paced" || cfg_.mode == "late" ||
-                     cfg_.mode == "guard" || cfg_.mode == "corrupt";
+                     cfg_.mode == "guard" || cfg_.mode == "corrupt" ||
+                     cfg_.mode == "earlyreuse";
   int64_t nextDeadlineUs = runStartUs_;
   const int injectedSeq =
       cfg_.mode == "corrupt" ? std::min(2, cfg_.frames - 1) : -1;
-  int submitted = 0;
+  const int victimSeq =
+      cfg_.mode == "earlyreuse" ? std::min(2, cfg_.frames - 2) : -1;
 
   for (int i = 0; i < cfg_.frames; i++) {
     if (stopFlag_.load() && i > 0) break;
-    if (paced) {
-      while (true) {
-        int64_t wait = nextDeadlineUs - nowUs();
-        if (wait <= 0) break;
-        std::vector<EncoderEvent> evs;
-        int n = enc_->poll(evs, (int)std::min<int64_t>(wait / 1000 + 1, 30),
-                           err);
-        if (n < 0) {
-          std::lock_guard<std::mutex> lk(mu_);
-          finishRun("failed", err);
-          closeEncoder();
-          return;
-        }
-        std::lock_guard<std::mutex> lk(mu_);
-        processEvents(evs, nowUs());
-        if (stopFlag_.load()) break;
-      }
-      if (stopFlag_.load() && i > 0) break;
+    if (!fatal_.empty()) break;
+
+    if (i == cfg_.switchAt) {
+      switchGeneration();
+      if (!fatal_.empty() || gens_.empty()) break;
+      // finishRun may have been called by a failed switch.
+      std::lock_guard<std::mutex> lk(mu_);
+      if (snap_.status == "failed") return;
     }
 
-    // Pick a FREE surface, or wait for one to come back from the codec.
+    Generation& g = cur();
+
+    if (paced) {
+      while (true) {
+        maybeInjectOverwrite(nowUs());
+        int64_t wait = nextDeadlineUs - nowUs();
+        if (wait <= 0) break;
+        pumpAndGate();
+        if (!fatal_.empty()) break;
+        if (stopFlag_.load()) break;
+        if (wait > 3000) sleepUs(1000);
+      }
+      if (stopFlag_.load() && i > 0) break;
+      if (!fatal_.empty()) break;
+    }
+
+    // Pick a FREE surface, grow the pool, or wait for a release.
     int idx = -1;
     int64_t stallStartUs = nowUs();
-    while (true) {
-      bool found = false;
-      for (int k = 0; k < enc_->surfaceCount(); k++) {
-        if (enc_->surface(k).state == Surface::State::Free) {
-          idx = k;
-          found = true;
-          break;
-        }
-      }
-      if (found) break;
-      if (stopFlag_.load()) break;
-      std::vector<EncoderEvent> evs;
-      int n = enc_->poll(evs, 5, err);
-      if (n < 0) {
-        std::lock_guard<std::mutex> lk(mu_);
-        finishRun("failed", err);
-        closeEncoder();
-        return;
-      }
-      {
-        std::lock_guard<std::mutex> lk(mu_);
-        processEvents(evs, nowUs());
-      }
-      if (nowUs() - stallStartUs > 15000000) {
-        std::lock_guard<std::mutex> lk(mu_);
-        finishRun("failed",
-                  "15 秒内没有任何表面归还（池已耗尽且回执停止）");
-        closeEncoder();
+    if (!acquireSurface(g, idx, nextDeadlineUs)) {
+      std::lock_guard<std::mutex> lk(mu_);
+      if (snap_.status == "failed") return;  // finishRun already ran
+      if (!fatal_.empty()) {
+        finishRun("failed", fatal_);
         return;
       }
     }
-    if (idx < 0) break;
+    if (idx < 0) break;  // stopped: fall through to the drain phase
     int64_t stallUs = nowUs() - stallStartUs;
     if (stallUs > 1500) {
       std::lock_guard<std::mutex> lk(mu_);
@@ -325,8 +833,8 @@ void Session::workerMain() {
       if (m_.backpressureStalls <= 6)
         logLine("背压：帧 " + std::to_string(i) + " 等待 " +
                 std::to_string(stallUs / 1000) + " ms 才拿到空闲表面；" +
-                std::to_string(enc_->surfaceCount()) +
-                " 个表面都仍被编码器持有");
+                std::to_string(activeSurfaces(g.enc.get())) +
+                " 个活跃表面都仍被编码器持有");
     }
 
     // In guard mode, verify the ownership semantics the hard way: a surface
@@ -335,31 +843,30 @@ void Session::workerMain() {
       std::lock_guard<std::mutex> lk(mu_);
       m_.guardChecks++;
       bool anyHeld = false;
-      for (int k = 0; k < enc_->surfaceCount(); k++) {
-        const Surface& s = enc_->surface(k);
+      for (int k = 0; k < g.enc->surfaceCount(); k++) {
+        const Surface& s = g.enc->surface(k);
         if (s.state == Surface::State::Queued) {
           anyHeld = true;
-          if (!enc_->surfaceWritable(k)) m_.guardRejections++;
+          if (!g.enc->surfaceWritable(k)) m_.guardRejections++;
         }
       }
       if (!anyHeld) m_.guardRejections++;  // no held surface: nothing to test
     }
 
     bool corrupt = (i == injectedSeq);
-    FramePlan plan = renderFrame((uint64_t)i, cfg_.width, cfg_.height, corrupt);
+    FramePlan plan = renderFrame((uint64_t)i, g.width, g.height, corrupt);
     int64_t submitUs = 0;
     {
       std::lock_guard<std::mutex> lk(mu_);
-      Surface& s = enc_->surface(idx);
+      Surface& s = g.enc->surface(idx);
       if (s.state != Surface::State::Free) {
         finishRun("failed",
                   "内部所有权冲突：填充前表面 " + std::to_string(idx) +
                       " 不是 FREE 状态");
-        closeEncoder();
         return;
       }
       s.state = Surface::State::Filling;
-      convertRgbToSurface(plan, layout_, s.refs, s.planeBytes);
+      convertRgbToSurface(plan, g.layout, s.refs, s.planeBytes);
       s.fillCount++;
       s.heldSeq = (uint64_t)i;
       s.state = Surface::State::Queued;
@@ -371,6 +878,7 @@ void Session::workerMain() {
       if (fv) {
         fv->status = "submitted";
         fv->surfaceIndex = idx;
+        fv->gen = g.id;
         fv->hasSrc = true;
         fv->corrupted = corrupt;
         if (corrupt) fv->note = "已向待编码画面注入故障";
@@ -386,153 +894,234 @@ void Session::workerMain() {
       submitUs_[(uint64_t)i] = submitUs;
     }
     std::string serr;
-    if (!enc_->submit(idx, (uint64_t)i, (int64_t)i * 1000 / cfg_.fps, serr)) {
+    if (!g.enc->submit(idx, (uint64_t)i, (int64_t)i * 1000 / cfg_.fps, serr)) {
       std::lock_guard<std::mutex> lk(mu_);
-      enc_->surface(idx).state = Surface::State::Free;
+      g.enc->surface(idx).state = Surface::State::Free;
       finishRun("failed", "提交帧 " + std::to_string(i) + " 失败：" + serr);
-      closeEncoder();
       return;
     }
     {
       std::lock_guard<std::mutex> lk(mu_);
       m_.accepted++;
-      int inFlight = 0;
-      for (int k = 0; k < enc_->surfaceCount(); k++)
-        if (enc_->surface(k).state == Surface::State::Queued) inFlight++;
-      maxInFlightObserved_ = std::max(maxInFlightObserved_, inFlight);
-      m_.maxInFlight = maxInFlightObserved_;
+      updatePeaks();
     }
-    submitted++;
+
+    // Arm the earlyreuse fault: overwrite this surface while the backend is
+    // still scanning it for this frame.
+    if (i == victimSeq) {
+      std::lock_guard<std::mutex> lk(mu_);
+      overwritePending_ = true;
+      overwriteAtUs_ =
+          submitUs + (int64_t)(cfg_.readDelayMs + cfg_.scanMs / 2) * 1000;
+      overwriteSurface_ = idx;
+      overwritePlanSeq_ = (uint64_t)(i + 1);
+      overwriteGen_ = g.id;
+      logLine("故障注入已布防：帧 " + std::to_string(i) +
+              " 的表面将在读取窗口内被覆写为帧 " + std::to_string(i + 1) +
+              " 的内容");
+    }
 
     // Pull anything already available so receipts are not artificially held.
-    std::vector<EncoderEvent> evs;
-    int n = enc_->poll(evs, 0, err);
-    if (n < 0) {
-      std::lock_guard<std::mutex> lk(mu_);
-      finishRun("failed", err);
-      closeEncoder();
-      return;
-    }
-    {
-      std::lock_guard<std::mutex> lk(mu_);
-      processEvents(evs, nowUs());
-    }
+    pumpAndGate();
+    if (!fatal_.empty()) break;
     nextDeadlineUs += framePeriodUs;
     if (!paced) nextDeadlineUs = nowUs();
     if (nowUs() > nextDeadlineUs + 4 * framePeriodUs) nextDeadlineUs = nowUs();
     if (stopFlag_.load()) break;
   }
 
-  (void)submitted;
-
-  // End-of-stream drain.
+  // End-of-stream drain on every generation.
   {
+    Generation& g = cur();
     std::string eerr;
-    bool eosOk = enc_->requestEos(eerr);
-    int64_t drainStartUs = nowUs();
-    int64_t lastProgressUs = drainStartUs;
+    bool eosOk = g.enc->requestEos(eerr);
     {
       std::lock_guard<std::mutex> lk(mu_);
+      g.eosRequested = true;
       snap_.eosRequested = true;
       snap_.status = "draining";
       snap_.phase = "draining";
       logLine(eosOk ? "已请求结束排空，正在取回剩余码流"
                     : "结束命令被拒绝（" + eerr + "），尽力排空");
     }
-    for (;;) {
-      if (stopFlag_.load()) break;
-      std::vector<EncoderEvent> evs;
-      int n = enc_->poll(evs, 10, err);
-      if (n < 0) {
-        std::lock_guard<std::mutex> lk(mu_);
-        finishRun("failed", err);
-        closeEncoder();
-        return;
+  }
+  int64_t drainStartUs = nowUs();
+  int64_t lastProgressUs = drainStartUs;
+  for (;;) {
+    if (stopFlag_.load()) break;
+    if (!fatal_.empty()) break;
+    maybeInjectOverwrite(nowUs());
+    bool applied = pumpAndGate();
+    if (!fatal_.empty()) break;
+    if (applied) lastProgressUs = nowUs();
+    bool allDone = true;
+    size_t pendingCount = 0;
+    {
+      std::lock_guard<std::mutex> lk(mu_);
+      pendingCount = pending_.size();
+      for (auto& gp : gens_) {
+        if (gp->closed) continue;
+        if (!gp->eosRequested || !gp->enc->eosComplete()) allDone = false;
+        for (int i = 0; i < gp->enc->surfaceCount(); i++) {
+          Surface::State st = gp->enc->surface(i).state;
+          if (st == Surface::State::Queued || st == Surface::State::Filling)
+            allDone = false;
+        }
       }
-      int64_t t = nowUs();
-      {
-        std::lock_guard<std::mutex> lk(mu_);
-        int before = m_.bitstreams + m_.released;
-        processEvents(evs, t);
-        if (m_.bitstreams + m_.released != before) lastProgressUs = t;
-      }
-      if (enc_->eosComplete()) break;
-      if (t - lastProgressUs > 5000000) {
-        std::lock_guard<std::mutex> lk(mu_);
-        logLine("排空 5 秒无新输出，报告为未完成排空");
-        break;
+      // Retire generations that have fully drained.
+      for (size_t gi = 0; gi + 1 < gens_.size(); gi++) {
+        Generation& old = *gens_[gi];
+        if (old.closed || !old.eosRequested || !old.enc->eosComplete())
+          continue;
+        bool anyHeld = false;
+        for (int i = 0; i < old.enc->surfaceCount(); i++) {
+          Surface::State st = old.enc->surface(i).state;
+          if (st == Surface::State::Queued || st == Surface::State::Filling)
+            anyHeld = true;
+        }
+        bool pendingForGen = false;
+        for (auto& pe : pending_)
+          if (pe.gen == old.id) pendingForGen = true;
+        if (!anyHeld && !pendingForGen) {
+          logLine("代次 " + std::to_string(old.id) +
+                  " 的所有表面归还均已实际确认，旧分辨率资源销毁");
+          closeGeneration(old);
+        }
       }
     }
+    if (allDone && pendingCount == 0) break;
+    // In step mode the user may hold events back indefinitely; only the
+    // free-running path gets a no-progress watchdog.
+    if (!stepMode_ && cfg_.script.empty() &&
+        nowUs() - lastProgressUs > 5000000) {
+      std::lock_guard<std::mutex> lk(mu_);
+      logLine("排空 5 秒无新输出，报告为未完成排空");
+      break;
+    }
+    sleepUs(2000);
+  }
+
+  {
     std::lock_guard<std::mutex> lk(mu_);
-    snap_.eosComplete = enc_->eosComplete();
+    bool eosAll = true;
+    for (auto& gp : gens_)
+      if (!gp->closed && !gp->enc->eosComplete()) eosAll = false;
+    snap_.eosComplete = eosAll;
     snap_.framesDrained = m_.bitstreams;
     m_.framesDrained = m_.bitstreams;
-    logLine(snap_.eosComplete
-                ? "排空完成：所有待取码流已取回，表面全部归还"
-                : "排空未完成：编码器未确认结束");
+    logLine(eosAll ? "排空完成：所有待取码流已取回，表面全部归还"
+                   : "排空未完成：编码器未确认结束");
   }
 
   {
     std::lock_guard<std::mutex> lk(mu_);
     int leaked = 0;
+    for (auto& gp : gens_) {
+      if (gp->closed) continue;
+      for (int i = 0; i < gp->enc->surfaceCount(); i++) {
+        Surface::State st = gp->enc->surface(i).state;
+        if (st != Surface::State::Free && st != Surface::State::Retired)
+          leaked++;
+      }
+    }
     refreshSurfacesLocked();
     finalSurfaces_ = snap_.surfaces;
-    for (int i = 0; i < enc_->surfaceCount(); i++)
-      if (enc_->surface(i).state != Surface::State::Free) leaked++;
     snap_.leakedSurfaces = leaked;
     if (leaked)
       logLine("警告：" + std::to_string(leaked) + " 个表面始终未被编码器归还");
     pruneArtifacts();
     int64_t endedUs = nowUs();
-    closeEncoder();
-    finishRun("completed", "", endedUs);
+    finishRun(fatal_.empty() ? "completed" : "failed", fatal_, endedUs);
+    for (auto& gp : gens_) closeGeneration(*gp);
+    snap_.encoderClosed = true;
+    snap_.decoderOpen = false;
   }
 }
 
+// ---------------------------------------------------------------------------
+// Views and accounting
+// ---------------------------------------------------------------------------
+
+void Session::updatePeaks() {
+  // mu_ held by caller.
+  int inFlight = 0, active = 0;
+  size_t mapped = 0;
+  for (auto& gp : gens_) {
+    if (gp->closed) continue;
+    for (int i = 0; i < gp->enc->surfaceCount(); i++) {
+      Surface& s = gp->enc->surface(i);
+      if (s.state == Surface::State::Retired) continue;
+      active++;
+      mapped += s.totalBytes;
+      if (s.state == Surface::State::Queued) inFlight++;
+    }
+  }
+  maxInFlightObserved_ = std::max(maxInFlightObserved_, inFlight);
+  m_.maxInFlight = maxInFlightObserved_;
+  m_.peakActiveSurfaces = std::max(m_.peakActiveSurfaces, active);
+  snap_.mappedBytes = mapped;
+  m_.surfaceBytes = mapped;
+  if (mapped > m_.peakMappedBytes) m_.peakMappedBytes = mapped;
+  size_t rss = processRssKb();
+  if ((int)rss > m_.peakRssKb) m_.peakRssKb = (int)rss;
+}
+
 void Session::refreshSurfacesLocked() {
-  if (!enc_) return;
   snap_.surfaces.clear();
-  for (int i = 0; i < enc_->surfaceCount(); i++) {
-    Surface& s = enc_->surface(i);
-    SurfaceView v;
-    v.index = s.index;
-    v.state = s.stateName();
-    v.seq = s.heldSeq;
-    v.reuse = s.reuseCount;
-    v.fills = (int)s.fillCount;
-    v.bytes = s.totalBytes;
-    v.deviceMemory = s.deviceMemory;
-    v.fmt = pixFmtName(s.fmt);
-    v.visibleW = s.visibleW;
-    v.visibleH = s.visibleH;
-    v.codedW = s.codedW;
-    v.codedH = s.codedH;
-    v.stride0 = s.refs.stride[0];
-    v.stride1 = s.refs.stride[1];
-    v.stride2 = s.refs.stride[2];
-    v.releaseCond = caps_.releaseSemantics;
-    snap_.surfaces.push_back(v);
+  snap_.generations.clear();
+  for (auto& gp : gens_) {
+    Generation& g = *gp;
+    GenerationView gv;
+    gv.id = g.id;
+    gv.width = g.width;
+    gv.height = g.height;
+    if (g.closed) {
+      // Keep reclaimed generations visible: their surfaces are gone, which is
+      // exactly the evidence that the old pool was fully released.
+      gv.state = "done";
+      snap_.generations.push_back(gv);
+      continue;
+    }
+    gv.state = g.eosRequested
+                   ? (g.enc->eosComplete() ? "done" : "draining")
+                   : "active";
+    int freeN = 0;
+    size_t bytes = 0;
+    for (int i = 0; i < g.enc->surfaceCount(); i++) {
+      Surface& s = g.enc->surface(i);
+      SurfaceView v;
+      v.index = s.index;
+      v.gen = g.id;
+      v.state = s.stateName();
+      v.seq = s.heldSeq;
+      v.reuse = s.reuseCount;
+      v.fills = (int)s.fillCount;
+      v.bytes = s.totalBytes;
+      v.deviceMemory = s.deviceMemory;
+      v.fmt = pixFmtName(s.fmt);
+      v.visibleW = s.visibleW;
+      v.visibleH = s.visibleH;
+      v.codedW = s.codedW;
+      v.codedH = s.codedH;
+      v.stride0 = s.refs.stride[0];
+      v.stride1 = s.refs.stride[1];
+      v.stride2 = s.refs.stride[2];
+      v.releaseCond = g.caps.releaseSemantics;
+      snap_.surfaces.push_back(v);
+      if (s.state != Surface::State::Retired) {
+        gv.surfaces++;
+        bytes += s.totalBytes;
+        if (s.state == Surface::State::Free) freeN++;
+      }
+    }
+    gv.freeSurfaces = freeN;
+    gv.bytes = bytes;
+    snap_.generations.push_back(gv);
   }
   snap_.version++;
 }
 
-void Session::processEvents(std::vector<EncoderEvent>& evs, int64_t now) {
-  for (auto& ev : evs) {
-    if (ev.type == EncoderEvent::Type::BitstreamReady) {
-      handleBitstream(ev, now);
-    } else if (ev.type == EncoderEvent::Type::SurfaceReleased) {
-      handleRelease(ev, now);
-    } else if (ev.type == EncoderEvent::Type::Fatal) {
-      fatal_ = ev.detail;
-      logLine("后端致命错误：" + ev.detail);
-    }
-  }
-  size_t rss = processRssKb();
-  if ((int)rss > m_.peakRssKb) m_.peakRssKb = (int)rss;
-  refreshSurfacesLocked();
-}
-
-void Session::handleBitstream(EncoderEvent& ev, int64_t now) {
+void Session::handleBitstream(EncoderEvent& ev, Generation& g, int64_t now) {
   m_.bitstreams++;
   FrameView* fv = frameFor(ev.seq);
   if (!fv) {
@@ -559,13 +1148,13 @@ void Session::handleBitstream(EncoderEvent& ev, int64_t now) {
   a.au = ev.data;
   a.keyframe = ev.keyframe;
 
-  if (!snap_.decoderOpen || !cfg_.verify) {
+  if (!g.decoderOpen || !cfg_.verify) {
     fv->status = "unverified";
     return;
   }
   YuvView view;
   std::string derr;
-  bool got = dec_.decode(ev.data, view, derr);
+  bool got = g.dec.decode(ev.data, view, derr);
   fv->decodeClean = derr.empty();
   if (!derr.empty()) {
     m_.decodeErrors++;
@@ -586,6 +1175,23 @@ void Session::handleBitstream(EncoderEvent& ev, int64_t now) {
   fv->markerDecoded = mr.bits;
   fv->markerOk = (mr.blocks == kMarkerBits && mr.bits == expected);
   if (!fv->markerOk) m_.markerMismatches++;
+
+  CornerReading cr = readCornerTags(view);
+  fv->cornerExpected = expected;
+  for (int c = 0; c < 4; c++) fv->cornerTags[c] = cr.tag[c];
+  fv->cornerValid = cr.validCount;
+  fv->cornersMixed = cr.mixed;
+  bool cornerDataOk = cr.validCount >= 3;
+  bool cornersAllExpected = cornerDataOk && !cr.mixed;
+  if (cornersAllExpected)
+    for (int c = 0; c < 4; c++)
+      if (cr.valid[c] && cr.tag[c] != expected) cornersAllExpected = false;
+  fv->cornersOk = cornersAllExpected;
+  if (cr.mixed) {
+    m_.mixedFrames++;
+  } else if (cornerDataOk && !fv->cornersOk) {
+    m_.cornerMismatches++;
+  }
 
   uint8_t levels[3] = {255, 255, 255};
   readPatchLevels(view, levels);
@@ -624,7 +1230,7 @@ void Session::handleBitstream(EncoderEvent& ev, int64_t now) {
   if (!pictureOk) m_.pictureMismatches++;
 
   bool pass = fv->markerOk && fv->patchesOk && fv->colorsOk && pictureOk &&
-              fv->decodeClean;
+              fv->decodeClean && (cornerDataOk ? fv->cornersOk : true);
   if (fv->corrupted) {
     // The injected fault must be observable: the marker check has to fail,
     // while the rest of the pipeline still decodes cleanly.
@@ -632,15 +1238,26 @@ void Session::handleBitstream(EncoderEvent& ev, int64_t now) {
     fv->note = fv->markerOk ? "注入的故障未被核对发现"
                             : "已通过帧号标记检出注入的故障";
   }
-  if (pass && fv->corrupted) {
+  if (fv->corrupted && pass) {
     fv->status = "detected";
     m_.detected++;
+  } else if (cr.mixed && cfg_.mode == "earlyreuse" && m_.detected == 0) {
+    // The premature-reuse fault must leave an identifiable torn frame.
+    fv->status = "detected";
+    m_.detected++;
+    fv->note = "串帧检出：四角标 " + std::to_string(cr.tag[0]) + "/" +
+               std::to_string(cr.tag[1]) + "/" + std::to_string(cr.tag[2]) +
+               "/" + std::to_string(cr.tag[3]) +
+               " 不一致——提前复用在解码画面留下可识别串帧";
+    logLine("帧 " + std::to_string(ev.seq) + "：" + fv->note);
   } else if (pass) {
     fv->status = "verified";
     m_.verified++;
   } else {
     fv->status = "fail";
     m_.failed++;
+    if (cr.mixed && fv->note.empty())
+      fv->note = "四角标不一致（串帧），但本次运行未注入提前复用故障";
   }
   if (ev.seq == 0 || (fv->corrupted && !fv->markerOk)) {
     logLine("解码帧 " + std::to_string(ev.seq) + "：" +
@@ -653,7 +1270,7 @@ void Session::handleBitstream(EncoderEvent& ev, int64_t now) {
   fv->hasOut = !a.out.rgb.empty();
 }
 
-void Session::handleRelease(EncoderEvent& ev, int64_t now) {
+void Session::handleRelease(EncoderEvent& ev, Generation& g, int64_t now) {
   m_.released++;
   FrameView* fv = frameFor(ev.seq);
   if (fv && !fv->surfaceReusable) {
@@ -662,17 +1279,44 @@ void Session::handleRelease(EncoderEvent& ev, int64_t now) {
     if (sit != submitUs_.end() && fv->submitToReleaseMs < 0) {
       fv->submitToReleaseMs = (double)(now - sit->second) / 1000.0;
       latRel_.push_back(fv->submitToReleaseMs);
+      relLagMs_.push_back(fv->submitToReleaseMs);
+      if (relLagMs_.size() > 32) relLagMs_.erase(relLagMs_.begin());
+    }
+  }
+  if (ev.surfaceIndex >= 0 && ev.surfaceIndex < g.enc->surfaceCount()) {
+    Surface& s = g.enc->surface(ev.surfaceIndex);
+    if (s.state == Surface::State::Queued) {
+      s.state = Surface::State::Free;
+      s.reuseCount++;
+      if (ev.surfaceIndex < (int)g.idleSinceUs.size())
+        g.idleSinceUs[ev.surfaceIndex] = now;
+    } else if (s.state == Surface::State::Retired) {
+      logLine("代次 " + std::to_string(g.id) + " 表面 " +
+              std::to_string(ev.surfaceIndex) +
+              " 的归还到达时该表面已退役，按代次记账后忽略");
+    }
+    // A stale release from an old generation must never touch the new
+    // pool's same-numbered surface. Detect and log the interleaving.
+    if (g.id != gens_.back()->id) {
+      Generation& ng = *gens_.back();
+      if (!ng.closed && ev.surfaceIndex < ng.enc->surfaceCount()) {
+        Surface& ns = ng.enc->surface(ev.surfaceIndex);
+        if (ns.state == Surface::State::Queued ||
+            ns.state == Surface::State::Filling) {
+          m_.staleGenReleases++;
+          logLine("旧代次 " + std::to_string(g.id) + " 表面 " +
+                  std::to_string(ev.surfaceIndex) +
+                  " 的归还到达时，新代次 " + std::to_string(ng.id) +
+                  " 的同号表面正被占用（帧 " +
+                  std::to_string(ns.heldSeq == UINT64_MAX ? -1
+                                                          : (long long)ns.heldSeq) +
+                  "）——按代次隔离，新表面不受影响");
+        }
+      }
     }
   }
   if (!ev.detail.empty()) logLine("表面回执：" + ev.detail);
-}
-
-void Session::closeEncoder() {
-  if (enc_) enc_->shutdown();
-  enc_.reset();
-  dec_.close();
-  snap_.decoderOpen = false;
-  snap_.encoderClosed = true;
+  maybeShrink(g);
 }
 
 void Session::pruneArtifacts() {
@@ -710,8 +1354,7 @@ void Session::finishRun(const std::string& status, const std::string& error,
   m_.maxSubmitToAuMs = percentile(latAu_, 1.0);
   m_.p50SubmitToReleaseMs = percentile(latRel_, 0.5);
   m_.maxSubmitToReleaseMs = percentile(latRel_, 1.0);
-  size_t rss = processRssKb();
-  if ((int)rss > m_.peakRssKb) m_.peakRssKb = (int)rss;
+  updatePeaks();
   snap_.metrics = m_;
   snap_.frames = frames_;
   if (!finalSurfaces_.empty()) snap_.surfaces = finalSurfaces_;
@@ -723,7 +1366,8 @@ void Session::finishRun(const std::string& status, const std::string& error,
                  m_.duplicateSeq == 0;
   bool allReleased = snap_.leakedSurfaces == 0;
   bool encodeCountOk = m_.bitstreams >= expected;
-  int injected = cfg_.mode == "corrupt" ? 1 : 0;
+  int injected =
+      (cfg_.mode == "corrupt" || cfg_.mode == "earlyreuse") ? 1 : 0;
   bool pass = m_.verified >= expected - injected && m_.failed == 0 &&
               m_.detected == injected && m_.lost == 0 && orderOk &&
               allReleased && encodeCountOk &&
@@ -733,7 +1377,7 @@ void Session::finishRun(const std::string& status, const std::string& error,
   snap_.pipelineVerified = pass && status == "completed";
   if (snap_.pipelineVerified) {
     snap_.verificationNote =
-        "送帧链路已证明：每个提交帧都产出访问单元，解码得到的画面在帧号、参考色块、颜色与内容上都与源画面一致，且所有表面都已归还 FREE。";
+        "送帧链路已证明：每个提交帧都产出访问单元，解码得到的画面在帧号、角标、参考色块、颜色与内容上都与源画面一致，且所有表面都已归还 FREE。";
   } else if (status == "completed") {
     snap_.verificationNote =
         "运行结束但未达验收：通过 " +
@@ -741,7 +1385,8 @@ void Session::finishRun(const std::string& status, const std::string& error,
         "，失败 " + std::to_string(m_.failed) + "，检出 " +
         std::to_string(m_.detected) + "，丢失 " +
         std::to_string(m_.lost) + "，乱序 " + std::to_string(m_.outOfOrder) +
-        "，未归还表面 " + std::to_string(snap_.leakedSurfaces);
+        "，串帧 " + std::to_string(m_.mixedFrames) + "，未归还表面 " +
+        std::to_string(snap_.leakedSurfaces);
   } else {
     snap_.verificationNote = "运行未完成：" + error;
   }
@@ -751,6 +1396,38 @@ void Session::finishRun(const std::string& status, const std::string& error,
   } else {
     snap_.verificationNote +=
         " 硬件覆盖：本次使用真实 V4L2 M2M 编码节点。";
+  }
+
+  // Capacity rationale from the measured release feedback.
+  double periodMs = 1000.0 / std::max(1, cfg_.fps);
+  if (m_.p50SubmitToReleaseMs >= 0) {
+    double lag = m_.p50SubmitToReleaseMs;
+    int k = (int)std::ceil(lag / periodMs);
+    std::string h = "释放滞后 p50 " + std::to_string((int)(lag + 0.5)) +
+                    " ms ≈ " + std::to_string(k) + " 个帧间隔（" +
+                    std::to_string((int)(periodMs + 0.5)) + " ms）";
+    h += "：稳态在途约 " + std::to_string(k) +
+         " 个表面，固定池容量建议 ≥ " + std::to_string(k + 1) + "。";
+    if (cfg_.sched == "elastic") {
+      h += " 本次弹性池：初始 " + std::to_string(cfg_.pool) + "，峰值活跃 " +
+           std::to_string(m_.peakActiveSurfaces) + "，增长 " +
+           std::to_string(m_.grows) + " 次、收缩 " +
+           std::to_string(m_.shrinks) + " 次、选择等待 " +
+           std::to_string(m_.schedWaits) + " 次。";
+    } else {
+      h += " 本次固定池 " + std::to_string(cfg_.pool) + "，阻塞 " +
+           std::to_string(m_.backpressureStalls) + " 次 / 累计 " +
+           std::to_string((int)(m_.stallMsTotal + 0.5)) + " ms。";
+    }
+    h += " 选定规则：预计归还超过半帧预算才增长，否则等待；空闲满 8 个帧周期则收缩。";
+    if (stepMode_ || !cfg_.script.empty())
+      h += "（本次含单步/脚本停顿，时延数值含人为停顿，容量结论以自由重放为准。）";
+    h += snap_.timingSource == "device"
+             ? "（时序来自真实设备。）"
+             : "（时序来自软件模型模拟，非设备实测。）";
+    snap_.capacityHint = h;
+  } else {
+    snap_.capacityHint = "未测得释放滞后，无法给出容量建议。";
   }
   snap_.version++;
 }

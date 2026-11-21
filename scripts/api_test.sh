@@ -96,6 +96,51 @@ PY
 rc=$?
 [ $rc -ne 0 ] && fail=1
 
+echo "== 单步放行：事件门逐事件放行并记录轨迹"
+curl -sf -X POST "$BASE/api/start?backend=openh264&mode=late&frames=10&pool=3&receiptLagMs=150&step=1" >/dev/null \
+  || { echo "FAIL /api/start step=1"; exit 1; }
+GATE=""
+for _ in $(seq 1 200); do
+  ST=$(curl -sf "$BASE/api/state")
+  GATE=$(python3 -I -c 'import json,sys;s=json.load(sys.stdin);print(s["pendingPackets"]+s["pendingReturns"])' <<<"$ST")
+  [ "$GATE" -gt 0 ] 2>/dev/null && break
+  sleep 0.1
+done
+check "事件门拦住待放行事件" "$([ "$GATE" -gt 0 ] && echo yes)" "yes"
+check "单步模式标记" "$(python3 -I -c 'import json,sys;print(json.load(sys.stdin)["stepMode"])' <<<"$ST")" "True"
+check "未放行前轨迹为空" "$(python3 -I -c 'import json,sys;print(json.load(sys.stdin)["trace"])' <<<"$ST")" ""
+for i in 1 2 3 4; do
+  curl -sf -X POST "$BASE/api/step?kind=any&n=1" >/dev/null || { echo "FAIL /api/step"; fail=1; }
+  sleep 0.1
+done
+ST=$(curl -sf "$BASE/api/state")
+check "步进 4 次后轨迹长度" "$(python3 -I -c 'import json,sys;print(len(json.load(sys.stdin)["trace"]))' <<<"$ST")" "4"
+curl -sf -X POST "$BASE/api/continue" >/dev/null || { echo "FAIL /api/continue"; fail=1; }
+for _ in $(seq 1 300); do
+  ST=$(curl -sf "$BASE/api/state")
+  STATUS=$(python3 -I -c 'import json,sys;print(json.load(sys.stdin)["status"])' <<<"$ST")
+  case "$STATUS" in completed|failed|stopped) break;; esac
+  sleep 0.1
+done
+TRACE=$(python3 -I -c 'import json,sys;print(json.load(sys.stdin)["trace"])' <<<"$ST")
+check "单步运行完成" "$STATUS" "completed"
+check "轨迹非空" "$([ -n "$TRACE" ] && echo yes)" "yes"
+check "时序来源标记为模拟" "$(python3 -I -c 'import json,sys;print(json.load(sys.stdin)["timingSource"])' <<<"$ST")" "simulated"
+check "容量建议非空" "$(python3 -I -c 'import json,sys;print(bool(json.load(sys.stdin)["capacityHint"]))' <<<"$ST")" "True"
+
+echo "== 轨迹重放：同一脚本必须复现同一轨迹"
+curl -sf -X POST "$BASE/api/start?backend=openh264&mode=late&frames=10&pool=3&receiptLagMs=150&script=$TRACE" >/dev/null \
+  || { echo "FAIL /api/start script"; exit 1; }
+for _ in $(seq 1 300); do
+  ST=$(curl -sf "$BASE/api/state")
+  STATUS=$(python3 -I -c 'import json,sys;print(json.load(sys.stdin)["status"])' <<<"$ST")
+  case "$STATUS" in completed|failed|stopped) break;; esac
+  sleep 0.1
+done
+check "重放运行完成" "$STATUS" "completed"
+check "重放轨迹一致" "$(python3 -I -c 'import json,sys;print(json.load(sys.stdin)["trace"])' <<<"$ST")" "$TRACE"
+check "重放链路验收" "$(python3 -I -c 'import json,sys;print(json.load(sys.stdin)["pipelineVerified"])' <<<"$ST")" "True"
+
 echo "== 404 行为"
 code=$(curl -s -o /dev/null -w '%{http_code}' "$BASE/api/au?seq=99999")
 check "未知帧码流返回 404" "$code" "404"

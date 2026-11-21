@@ -204,6 +204,14 @@ std::string sessionJson(Session& s) {
   root.num("endedAtUs", snap.endedAtUs);
   root.num("latestSeq", (long long)snap.latestSeq);
   root.num("version", (long long)snap.version);
+  root.str("capacityHint", snap.capacityHint);
+  root.str("timingSource", snap.timingSource);
+  root.b("stepMode", snap.stepMode);
+  root.num("pendingPackets", snap.pendingPackets);
+  root.num("pendingReturns", snap.pendingReturns);
+  root.num("scriptPos", (long long)snap.scriptPos);
+  root.num("scriptLen", (long long)snap.scriptLen);
+  root.str("trace", snap.trace);
 
   J cfg;
   cfg.str("backend", snap.cfg.backend);
@@ -216,6 +224,16 @@ std::string sessionJson(Session& s) {
   cfg.num("receiptLagMs", snap.cfg.receiptLagMs);
   cfg.str("device", snap.cfg.device);
   cfg.str("format", snap.cfg.format);
+  cfg.str("sched", snap.cfg.sched);
+  cfg.num("poolMin", snap.cfg.poolMin).num("poolMax", snap.cfg.poolMax);
+  cfg.num("readDelayMs", snap.cfg.readDelayMs);
+  cfg.num("scanMs", snap.cfg.scanMs);
+  cfg.b("step", snap.cfg.step);
+  cfg.str("order", snap.cfg.order);
+  cfg.str("script", snap.cfg.script);
+  cfg.num("switchAt", snap.cfg.switchAt);
+  cfg.num("switchWidth", snap.cfg.switchWidth);
+  cfg.num("switchHeight", snap.cfg.switchHeight);
   root.raw("config", cfg.done());
 
   const EncoderCaps& c = snap.caps;
@@ -258,10 +276,24 @@ std::string sessionJson(Session& s) {
   sf.b("grantedDiffers", f.grantedDiffers);
   root.raw("format", sf.done());
 
+  std::vector<std::string> genArr;
+  for (auto& gv : snap.generations) {
+    J j;
+    j.num("id", gv.id);
+    j.num("width", gv.width).num("height", gv.height);
+    j.str("state", gv.state);
+    j.num("surfaces", gv.surfaces);
+    j.num("freeSurfaces", gv.freeSurfaces);
+    j.unum("bytes", gv.bytes);
+    genArr.push_back(j.done());
+  }
+  root.raw("generations", J::arr(genArr));
+
   std::vector<std::string> surfArr;
   for (auto& sv : snap.surfaces) {
     J j;
     j.num("index", sv.index);
+    j.num("gen", sv.gen);
     j.str("state", sv.state);
     j.num("seq", sv.seq == UINT64_MAX ? -1 : (long long)sv.seq);
     j.num("reuse", sv.reuse).num("fills", sv.fills);
@@ -283,6 +315,7 @@ std::string sessionJson(Session& s) {
     j.num("seq", fv.seq);
     j.num("order", fv.order);
     j.num("surfaceIndex", fv.surfaceIndex);
+    j.num("gen", fv.gen);
     j.str("status", fv.status);
     j.b("bitstreamReady", fv.bitstreamReady);
     j.b("surfaceReusable", fv.surfaceReusable);
@@ -294,6 +327,14 @@ std::string sessionJson(Session& s) {
     j.b("decodeClean", fv.decodeClean);
     j.b("corrupted", fv.corrupted);
     j.b("keyframe", fv.keyframe);
+    j.num("cornerExpected", fv.cornerExpected);
+    j.raw("cornerTags", J::arr({std::to_string(fv.cornerTags[0]),
+                                std::to_string(fv.cornerTags[1]),
+                                std::to_string(fv.cornerTags[2]),
+                                std::to_string(fv.cornerTags[3])}));
+    j.num("cornerValid", fv.cornerValid);
+    j.b("cornersOk", fv.cornersOk);
+    j.b("cornersMixed", fv.cornersMixed);
     j.num("auBytes", fv.auBytes);
     j.dbl("psnrMae", fv.meanAbsError);
     j.dbl("submitToAuMs", fv.submitToAuMs);
@@ -326,6 +367,14 @@ std::string sessionJson(Session& s) {
   mj.num("maxInFlight", m.maxInFlight);
   mj.num("guardChecks", m.guardChecks);
   mj.num("guardRejections", m.guardRejections);
+  mj.num("cornerMismatches", m.cornerMismatches);
+  mj.num("mixedFrames", m.mixedFrames);
+  mj.num("ownershipViolations", m.ownershipViolations);
+  mj.num("staleGenReleases", m.staleGenReleases);
+  mj.num("grows", m.grows).num("shrinks", m.shrinks);
+  mj.num("schedWaits", m.schedWaits);
+  mj.num("peakActiveSurfaces", m.peakActiveSurfaces);
+  mj.unum("peakMappedBytes", m.peakMappedBytes);
   mj.num("peakRssKb", m.peakRssKb).num("baselineRssKb", m.baselineRssKb);
   mj.unum("surfaceBytes", m.surfaceBytes);
   mj.num("framesDrained", m.framesDrained);
@@ -410,10 +459,37 @@ Response route(Session& session, const Request& req) {
     c.receiptLagMs = getI("receiptLagMs", 0);
     c.device = getS("device", "");
     c.format = getS("format", "");
+    c.sched = getS("sched", "fixed");
+    c.poolMin = getI("poolMin", 2);
+    c.poolMax = getI("poolMax", 8);
+    c.readDelayMs = getI("readDelayMs", 0);
+    c.scanMs = getI("scanMs", 0);
+    c.step = getI("step", 0) != 0;
+    c.order = getS("order", "any");
+    c.script = getS("script", "");
+    c.switchAt = getI("switchAt", -1);
+    c.switchWidth = getI("switchW", 0);
+    c.switchHeight = getI("switchH", 0);
     std::string err;
     if (!session.start(c, err)) return errorJson(409, err);
     J j;
     return jsonResponse(200, j.b("started", true).done());
+  }
+  if (p == "/api/step") {
+    if (req.method != "POST") return errorJson(405, "POST only");
+    auto q = parseQuery(req.query);
+    std::string kind = q.count("kind") ? q["kind"] : "any";
+    int n = q.count("n") ? atoi(q["n"].c_str()) : 1;
+    std::string err;
+    if (!session.stepEvents(kind, n, err)) return errorJson(409, err);
+    J j;
+    return jsonResponse(200, j.b("stepped", true).done());
+  }
+  if (p == "/api/continue") {
+    if (req.method != "POST") return errorJson(405, "POST only");
+    session.continueRun();
+    J j;
+    return jsonResponse(200, j.b("continued", true).done());
   }
   if (p == "/api/stop") {
     if (req.method != "POST") return errorJson(405, "POST only");

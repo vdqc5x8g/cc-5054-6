@@ -78,6 +78,19 @@ struct MarkerReading {
 MarkerReading readMarker(const YuvView& view);
 int readPatchLevels(const YuvView& view, uint8_t out[3]);
 
+// Per-frame unique corner tags: the frame number (low 12 bits) is drawn as
+// four spatially separated bit grids. If a surface is refilled while the
+// encoder is still reading it, the decoded picture tears and the four tags
+// disagree -- that is the identifiable frame-mixing signature.
+struct CornerReading {
+  uint16_t tag[4] = {0, 0, 0, 0};
+  bool valid[4] = {false, false, false, false};
+  int validCount = 0;
+  bool agree = false;  // every readable tag holds the same value
+  bool mixed = false;  // >=2 readable tags and they disagree (tearing)
+};
+CornerReading readCornerTags(const YuvView& view);
+
 struct Thumb {
   int width = 0, height = 0;
   std::vector<uint8_t> rgb;

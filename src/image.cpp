@@ -36,6 +36,35 @@ inline void rgbToYuv(int r, int g, int b, int& Y, int& U, int& V) {
   V = clamp8(((112 * r - 94 * g - 18 * b + 128) >> 8) + 128);
 }
 
+// Geometry shared by the corner-tag renderer and reader. Tags are 12 bits in
+// a 6x2 grid placed near the four corners, kept clear of the reference
+// patches (top-left) and the frame-number marker strip (bottom-right).
+struct CornerGeom {
+  int x[4], y[4];
+  int cell;  // block pitch in pixels (block itself is cell-2)
+};
+
+CornerGeom cornerGeom(int w, int h) {
+  const int block = std::min(10, std::max(4, std::min(w, h) / 40));
+  const int cell = block + 2;
+  const int tagW = 6 * cell - 2;
+  const int tagH = 2 * cell - 2;
+  const int markerBlockH = std::min(28, std::max(8, h / 12));
+  const int markerY = h - markerBlockH - 8;
+  CornerGeom g;
+  g.cell = cell;
+  g.x[0] = std::max(4, std::min(96, w - tagW - 4));
+  g.y[0] = 4;
+  g.x[1] = w - 4 - tagW;
+  g.y[1] = 4;
+  g.x[2] = 4;
+  g.y[2] = h - 4 - tagH;
+  g.x[3] = w - 4 - tagW;
+  g.y[3] = markerY - 4 - tagH;
+  if (g.y[3] < h / 2) g.y[3] = h - 4 - tagH;  // very small frames: give up separation
+  return g;
+}
+
 }  // namespace
 
 const char* pixFmtName(PixFmt f) {
@@ -142,6 +171,23 @@ FramePlan renderFrame(uint64_t seq, int width, int height,
     int shade = one ? 235 : 16;
     drawRect(plan.rgb, width, height, startX + bit * (blockW + 2), startY,
              blockW, blockH, {shade, shade, shade});
+  }
+
+  // Unique corner tags: the same 12-bit frame number repeated near all four
+  // corners. A torn encode (surface refilled mid-read) decodes with
+  // disagreeing corners, which is how premature reuse is identified.
+  {
+    const CornerGeom cg = cornerGeom(width, height);
+    for (int c = 0; c < 4; c++) {
+      for (int bit = 0; bit < kMarkerBits; bit++) {
+        bool one = (plan.marker >> bit) & 1u;
+        int shade = one ? 235 : 16;
+        int bx = cg.x[c] + (bit % 6) * cg.cell;
+        int by = cg.y[c] + (bit / 6) * cg.cell;
+        drawRect(plan.rgb, width, height, bx, by, cg.cell - 2, cg.cell - 2,
+                 {shade, shade, shade});
+      }
+    }
   }
 
   if (injectCorruption && width > 2 && height > 2) {
@@ -291,6 +337,52 @@ MarkerReading readMarker(const YuvView& view) {
     if (avg > 128) out.bits |= (uint16_t)(1u << bit);
     out.blocks++;
   }
+  return out;
+}
+
+CornerReading readCornerTags(const YuvView& view) {
+  CornerReading out;
+  const CornerGeom cg = cornerGeom(view.width, view.height);
+  for (int c = 0; c < 4; c++) {
+    int confidence = 0;
+    int blocks = 0;
+    uint16_t bits = 0;
+    for (int bit = 0; bit < kMarkerBits; bit++) {
+      int x0 = cg.x[c] + (bit % 6) * cg.cell;
+      int y0 = cg.y[c] + (bit / 6) * cg.cell;
+      int x1 = std::min(view.width, x0 + cg.cell - 2);
+      int y1 = std::min(view.height, y0 + cg.cell - 2);
+      if (x0 < 0 || y0 < 0 || x1 - x0 < 3 || y1 - y0 < 3) continue;
+      long sum = 0;
+      int n = 0;
+      for (int y = y0 + 1; y < y1 - 1; y++) {
+        const uint8_t* row = view.plane[0] + (size_t)y * view.stride[0];
+        for (int x = x0 + 1; x < x1 - 1; x++) {
+          sum += row[x];
+          n++;
+        }
+      }
+      if (n == 0) continue;
+      int avg = (int)(sum / n);
+      confidence += std::abs(avg - 128);
+      if (avg > 128) bits |= (uint16_t)(1u << bit);
+      blocks++;
+    }
+    out.tag[c] = bits;
+    // Require every block readable and a minimum contrast before trusting a
+    // tag; a smeared or absent tag is "no data", not a mismatch.
+    out.valid[c] = blocks == kMarkerBits && confidence >= 25 * kMarkerBits;
+    if (out.valid[c]) out.validCount++;
+  }
+  out.agree = out.validCount > 0;
+  for (int c = 0; c < 4; c++) {
+    if (!out.valid[c]) continue;
+    for (int d = c + 1; d < 4; d++) {
+      if (!out.valid[d]) continue;
+      if (out.tag[c] != out.tag[d]) out.agree = false;
+    }
+  }
+  out.mixed = out.validCount >= 2 && !out.agree;
   return out;
 }
 
